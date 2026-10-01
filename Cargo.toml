@@ -932,6 +932,10 @@ notify-types = { git = "https://github.com/zed-industries/notify", rev = "d842f1
 # per-crate scratch dirs are sufficient. Upstream issue:
 # https://github.com/dtolnay/cxx/issues/1752
 scratch = { path = "tooling/corgi/patches/scratch" }
+# python-environment-tools enables msvc_spectre_libs' `error` feature, which fails the build on
+# machines without the "MSVC Spectre-mitigated libs" Visual Studio component. The patched copy
+# only warns there and links the libs as usual when they are installed.
+msvc_spectre_libs = { path = "tooling/patches/msvc_spectre_libs" }
 
 [profile.dev]
 split-debuginfo = "unpacked"
