@@ -1023,6 +1023,15 @@ debug = "full"
 lto = false
 codegen-units = 16
 
+# Optimized build for running zed-lite locally (run.bat): incremental, no LTO and
+# parallel codegen, so rebuilds take a fraction of a `release` build.
+[profile.release-local]
+inherits = "release"
+debug = false
+lto = "off"
+codegen-units = 256
+incremental = true
+
 [workspace.lints.rust]
 unexpected_cfgs = { level = "allow" }
 
