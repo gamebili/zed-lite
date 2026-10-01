@@ -6,8 +6,8 @@ use serde::Deserialize;
 
 include!(concat!(env!("OUT_DIR"), "/key_wrap.rs"));
 
-/// Same container as the DSH green launcher writes: magic, 12-byte IV, 16-byte GCM tag,
-/// then the ciphertext of `{"key": ..., "url": ...}`.
+/// Layout of `key.enc`: magic, 12-byte IV, 16-byte GCM tag, then the AES-256-GCM ciphertext of
+/// `{"key": ..., "url": ...}`.
 const MAGIC: &[u8] = b"DSHK1";
 const TAG_LEN: usize = 16;
 pub const KEY_FILE_NAME: &str = "key.enc";
@@ -126,7 +126,7 @@ mod tests {
     }
 
     #[test]
-    fn decrypts_launcher_layout() {
+    fn decrypts_key_file_layout() {
         let blob = encrypt(
             br#"{"key":" sk-test ","url":"https://example.com/v1/"}"#,
             &TEST_WRAP_KEY,
