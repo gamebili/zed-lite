@@ -61,3 +61,7 @@ crates/docs_preprocessor/actions.json
 
 .local*
 .cache
+
+# Bundled DeepSeek credentials (key.enc) and the AES wrap key that decrypts it.
+# Never commit these; copy them in by hand on each build machine.
+/secrets/

@@ -6061,6 +6061,7 @@ mod tests {
     }
 
     #[gpui::test]
+    #[ignore = "zed-lite disables multi-workspace windows"]
     async fn test_restore_window_with_linked_worktree_and_multiple_project_groups(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -6243,6 +6244,7 @@ mod tests {
     }
 
     #[gpui::test]
+    #[ignore = "zed-lite disables multi-workspace windows"]
     async fn test_remove_project_group_falls_back_to_neighbor(cx: &mut gpui::TestAppContext) {
         crate::tests::init_test(cx);
 
@@ -6354,6 +6356,7 @@ mod tests {
     /// fallback searches for the same paths, `workspace_for_paths` must
     /// skip the doomed workspace so the assert in `remove` is satisfied.
     #[gpui::test]
+    #[ignore = "zed-lite disables multi-workspace windows"]
     async fn test_remove_fallback_skips_excluded_workspaces(cx: &mut gpui::TestAppContext) {
         crate::tests::init_test(cx);
 

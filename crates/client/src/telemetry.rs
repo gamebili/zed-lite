@@ -1061,7 +1061,11 @@ mod tests {
 
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            let settings_store = SettingsStore::test(cx);
+            let mut settings_store = SettingsStore::test(cx);
+            // zed-lite ships with telemetry off; these tests exercise the reporting path.
+            settings_store.update_user_settings(cx, |settings| {
+                settings.telemetry.get_or_insert_default().metrics = Some(true);
+            });
             cx.set_global(settings_store);
         });
     }

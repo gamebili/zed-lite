@@ -262,6 +262,11 @@ impl Settings for AutoUpdateSetting {
 #[derive(Default)]
 struct GlobalAutoUpdate(Option<Entity<AutoUpdater>>);
 
+/// zed-lite ships as a portable build inside internal tools. Updating from zed.dev would replace it
+/// with upstream Zed, so it never polls for or installs updates and explains why when asked.
+const UPDATE_EXPLANATION: Option<&str> =
+    Some("This build is distributed with internal tools; get new versions from there.");
+
 impl Global for GlobalAutoUpdate {}
 
 pub fn init(client: Arc<Client>, cx: &mut App) {
@@ -282,7 +287,8 @@ pub fn init(client: Arc<Client>, cx: &mut App) {
             .map(|channel| channel.poll_for_updates())
             .unwrap_or(false);
 
-        if option_env!("ZED_UPDATE_EXPLANATION").is_none()
+        if UPDATE_EXPLANATION.is_none()
+            && option_env!("ZED_UPDATE_EXPLANATION").is_none()
             && env::var("ZED_UPDATE_EXPLANATION").is_err()
             && poll_for_updates
         {
@@ -308,13 +314,14 @@ pub fn init(client: Arc<Client>, cx: &mut App) {
 }
 
 pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
-    if let Some(message) = option_env!("ZED_UPDATE_EXPLANATION")
+    if let Some(message) = UPDATE_EXPLANATION
+        .or(option_env!("ZED_UPDATE_EXPLANATION"))
         .map(ToOwned::to_owned)
         .or_else(|| env::var("ZED_UPDATE_EXPLANATION").ok())
     {
         drop(window.prompt(
             gpui::PromptLevel::Info,
-            "Zed was installed via a package manager.",
+            "Automatic updates are disabled.",
             Some(&message),
             &["OK"],
             cx,
