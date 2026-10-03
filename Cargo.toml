@@ -1036,6 +1036,19 @@ lto = "off"
 codegen-units = 256
 incremental = true
 
+[profile.release-small]
+inherits = "release"
+opt-level = "s"
+debug = false
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+incremental = false
+
+# The inherited release profile otherwise splits the main executable into 16 units.
+[profile.release-small.package]
+zed = { codegen-units = 1 }
+
 [workspace.lints.rust]
 unexpected_cfgs = { level = "allow" }
 
