@@ -240,55 +240,61 @@ pub fn deploy_context_menu(
             let builder = menu
                 .on_blur_subscription(Subscription::new(|| {}))
                 .when(run_to_cursor, |builder| {
-                    builder.action("Run to Cursor", Box::new(RunToCursor))
+                    builder.action(ui::tr("Run to Cursor"), Box::new(RunToCursor))
                 })
                 .when(evaluate_selection && has_selections, |builder| {
-                    builder.action("Evaluate Selection", Box::new(EvaluateSelectedText))
+                    builder.action(ui::tr("Evaluate Selection"), Box::new(EvaluateSelectedText))
                 })
                 .when(
                     run_to_cursor || (evaluate_selection && has_selections),
                     |builder| builder.separator(),
                 )
-                .action("Go to Definition", Box::new(GoToDefinition::default()))
-                .action("Go to Declaration", Box::new(GoToDeclaration::default()))
                 .action(
-                    "Go to Type Definition",
+                    ui::tr("Go to Definition"),
+                    Box::new(GoToDefinition::default()),
+                )
+                .action(
+                    ui::tr("Go to Declaration"),
+                    Box::new(GoToDeclaration::default()),
+                )
+                .action(
+                    ui::tr("Go to Type Definition"),
                     Box::new(GoToTypeDefinition::default()),
                 )
                 .action(
-                    "Go to Implementation",
+                    ui::tr("Go to Implementation"),
                     Box::new(GoToImplementation::default()),
                 )
                 .action(
-                    "Find All References",
+                    ui::tr("Find All References"),
                     Box::new(FindAllReferences::default()),
                 )
                 .action(
-                    "Show Incoming Calls",
+                    ui::tr("Show Incoming Calls"),
                     Box::new(zed_actions::ShowIncomingCalls),
                 )
                 .action(
-                    "Show Outgoing Calls",
+                    ui::tr("Show Outgoing Calls"),
                     Box::new(zed_actions::ShowOutgoingCalls),
                 )
                 .separator()
-                .action("Rename Symbol", Box::new(Rename))
-                .action("Format Buffer", Box::new(Format))
+                .action(ui::tr("Rename Symbol"), Box::new(Rename))
+                .action(ui::tr("Format Buffer"), Box::new(Format))
                 .when(format_selections, |cx| {
-                    cx.action("Format Selections", Box::new(FormatSelections))
+                    cx.action(ui::tr("Format Selections"), Box::new(FormatSelections))
                 })
                 .action(
-                    "Show Code Actions",
+                    ui::tr("Show Code Actions"),
                     Box::new(ToggleCodeActions {
                         deployed_from: None,
                         quick_launch: false,
                     }),
                 )
                 .separator()
-                .action("Cut", Box::new(Cut))
-                .action("Copy", Box::new(Copy))
-                .action("Copy and Trim", Box::new(CopyAndTrim))
-                .action("Paste", Box::new(Paste))
+                .action(ui::tr("Cut"), Box::new(Cut))
+                .action(ui::tr("Copy"), Box::new(Copy))
+                .action(ui::tr("Copy and Trim"), Box::new(CopyAndTrim))
+                .action(ui::tr("Paste"), Box::new(Paste))
                 .separator()
                 .action_disabled_when(
                     !has_reveal_target,
@@ -296,24 +302,27 @@ pub fn deploy_context_menu(
                     Box::new(RevealInFileManager),
                 )
                 .when(is_markdown, |builder| {
-                    builder.action("Open Markdown Preview", Box::new(OpenMarkdownPreview))
+                    builder.action(
+                        ui::tr("Open Markdown Preview"),
+                        Box::new(OpenMarkdownPreview),
+                    )
                 })
                 .when(is_svg, |builder| {
-                    builder.action("Open SVG Preview", Box::new(OpenSvgPreview))
+                    builder.action(ui::tr("Open SVG Preview"), Box::new(OpenSvgPreview))
                 })
                 .action_disabled_when(
                     !has_reveal_target,
-                    "Open in Terminal",
+                    ui::tr("Open in Terminal"),
                     Box::new(OpenInTerminal),
                 )
                 .action_disabled_when(
                     !has_git_repo,
-                    "Copy Permalink to Line",
+                    ui::tr("Copy Permalink to Line"),
                     Box::new(CopyPermalinkToLine),
                 )
                 .action_disabled_when(
                     !has_git_repo,
-                    "View File History",
+                    ui::tr("View File History"),
                     Box::new(git::FileHistory),
                 );
             match focus {

@@ -735,23 +735,13 @@ impl PlatformWindow for WindowsWindow {
                     config.cbSize = std::mem::size_of::<TASKDIALOGCONFIG>() as _;
                     config.hwndParent = handle;
                     config.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION;
-                    let title;
-                    let main_icon;
-                    match level {
-                        PromptLevel::Info => {
-                            title = windows::core::w!("Info");
-                            main_icon = TD_INFORMATION_ICON;
-                        }
-                        PromptLevel::Warning => {
-                            title = windows::core::w!("Warning");
-                            main_icon = TD_WARNING_ICON;
-                        }
-                        PromptLevel::Critical => {
-                            title = windows::core::w!("Critical");
-                            main_icon = TD_ERROR_ICON;
-                        }
+                    let (title, main_icon) = match level {
+                        PromptLevel::Info => ("Info", TD_INFORMATION_ICON),
+                        PromptLevel::Warning => ("Warning", TD_WARNING_ICON),
+                        PromptLevel::Critical => ("Critical", TD_ERROR_ICON),
                     };
-                    config.pszWindowTitle = title;
+                    let title = HSTRING::from(i18n::text(title));
+                    config.pszWindowTitle = PCWSTR::from_raw(title.as_ptr());
                     config.Anonymous1.pszMainIcon = main_icon;
                     let instruction = HSTRING::from(msg);
                     config.pszMainInstruction = PCWSTR::from_raw(instruction.as_ptr());

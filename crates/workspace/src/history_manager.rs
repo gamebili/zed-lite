@@ -2,6 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use fs::Fs;
 use gpui::{AppContext, Entity, Global, MenuItem};
+use settings::SettingsStore;
 use smallvec::SmallVec;
 use ui::{App, Context};
 use util::{ResultExt, paths::PathExt};
@@ -14,6 +15,20 @@ use crate::{
 pub fn init(fs: Arc<dyn Fs>, cx: &mut App) {
     let manager = cx.new(|_| HistoryManager::new());
     HistoryManager::set_global(manager.clone(), cx);
+    let weak_manager = manager.downgrade();
+    let mut language = ui::language();
+    cx.observe_global::<SettingsStore>(move |cx| {
+        let new_language = ui::language();
+        if new_language != language {
+            language = new_language;
+            #[cfg(not(target_os = "windows"))]
+            cx.set_dock_menu(vec![MenuItem::action(ui::tr("New Window"), NewWindow)]);
+            weak_manager
+                .update(cx, |manager, cx| manager.update_jump_list(cx))
+                .log_err();
+        }
+    })
+    .detach();
     HistoryManager::init(manager, fs, cx);
 }
 
@@ -99,7 +114,7 @@ impl HistoryManager {
     }
 
     fn update_jump_list(&mut self, cx: &mut Context<'_, HistoryManager>) {
-        let menus = vec![MenuItem::action("New Window", NewWindow)];
+        let menus = vec![MenuItem::action(ui::tr("New Window"), NewWindow)];
         let entries = self
             .history
             .iter()

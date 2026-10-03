@@ -3,7 +3,7 @@ mod persistence;
 
 use std::{
     cmp::{self, Reverse},
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -129,6 +129,7 @@ impl CommandPalette {
 
                 Some(Command {
                     name: SharedString::from(humanize_action_name(action.name())),
+                    localize: true,
                     action,
                     usage: None,
                 })
@@ -211,8 +212,63 @@ pub struct CommandPaletteDelegate {
 
 struct Command {
     name: SharedString,
+    localize: bool,
     action: Box<dyn Action>,
     usage: Option<CommandUsage>,
+}
+
+impl Command {
+    fn intercepted(name: SharedString, action: Box<dyn Action>) -> Self {
+        Self {
+            name,
+            localize: false,
+            action,
+            usage: None,
+        }
+    }
+}
+
+fn command_candidates(commands: &[Command]) -> Vec<StringMatchCandidate> {
+    commands
+        .iter()
+        .enumerate()
+        .flat_map(|(index, command)| {
+            let texts = if command.localize {
+                ui::search_texts(command.name.as_ref())
+            } else {
+                [command.name.as_ref(); 3]
+            };
+            texts
+                .into_iter()
+                .enumerate()
+                .filter_map(move |(alias_index, text)| {
+                    if texts[..alias_index].contains(&text) {
+                        None
+                    } else {
+                        let text = if text == command.name.as_ref() {
+                            command.name.clone()
+                        } else {
+                            SharedString::from(text.to_owned())
+                        };
+                        Some(StringMatchCandidate::new(index, text))
+                    }
+                })
+        })
+        .collect()
+}
+
+fn deduplicate_command_matches(matches: &mut Vec<StringMatch>) {
+    let mut seen_commands = HashSet::new();
+    matches.retain(|matched| seen_commands.insert(matched.candidate_id));
+}
+
+fn visible_highlight_positions(matched: &StringMatch, display_name: &str) -> Vec<usize> {
+    if matched.string.as_ref() == display_name {
+        matched.positions.clone()
+    } else {
+        // Alias matches refer to a different UTF-8 string than the displayed translation.
+        Vec::new()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -310,6 +366,7 @@ impl Clone for Command {
     fn clone(&self) -> Self {
         Self {
             name: self.name.clone(),
+            localize: self.localize,
             action: self.action.boxed_clone(),
             usage: self.usage,
         }
@@ -317,6 +374,14 @@ impl Clone for Command {
 }
 
 impl CommandPaletteDelegate {
+    fn display_name(command: &Command) -> SharedString {
+        if command.localize {
+            ui::tr(command.name.clone())
+        } else {
+            command.name.clone()
+        }
+    }
+
     fn new(
         command_palette: WeakEntity<CommandPalette>,
         workspace: WeakEntity<Workspace>,
@@ -363,11 +428,7 @@ impl CommandPaletteDelegate {
                 matches.remove(idx);
             }
             let string = SharedString::from(string);
-            commands.push(Command {
-                name: string.clone(),
-                action,
-                usage: None,
-            });
+            commands.push(Command::intercepted(string.clone(), action));
             new_matches.push(StringMatch {
                 candidate_id: commands.len() - 1,
                 string,
@@ -458,9 +519,9 @@ impl CommandPaletteDelegate {
             })
             .child(
                 ButtonLike::new(("remove-command-history", ix))
-                    .aria_label("Remove from Command History")
+                    .aria_label(ui::tr("Remove from Command History"))
                     .tooltip(Tooltip::for_action_title(
-                        "Remove from Command History",
+                        ui::tr("Remove from Command History"),
                         &RemoveSelected,
                     ))
                     .child(
@@ -609,11 +670,7 @@ impl PickerDelegate for CommandPaletteDelegate {
                 }
                 commands.sort_by_key(|command| (Reverse(command.usage), command.name.clone()));
 
-                let candidates = commands
-                    .iter()
-                    .enumerate()
-                    .map(|(ix, command)| StringMatchCandidate::new(ix, &command.name))
-                    .collect::<Vec<_>>();
+                let candidates = command_candidates(&commands);
 
                 let mut matches = fuzzy_nucleo::match_strings_async(
                     &candidates,
@@ -625,6 +682,8 @@ impl PickerDelegate for CommandPaletteDelegate {
                     executor,
                 )
                 .await;
+
+                deduplicate_command_matches(&mut matches);
 
                 let used_commands = commands
                     .iter()
@@ -770,6 +829,8 @@ impl PickerDelegate for CommandPaletteDelegate {
     ) -> Option<Self::ListItem> {
         let matching_command = self.matches.get(ix)?;
         let command = self.commands.get(matching_command.candidate_id)?;
+        let display_name = Self::display_name(command);
+        let positions = visible_highlight_positions(matching_command, &display_name);
 
         Some(
             ListItem::new(ix)
@@ -782,13 +843,7 @@ impl PickerDelegate for CommandPaletteDelegate {
                         .py_px()
                         .justify_between()
                         .gap_2()
-                        .child(
-                            HighlightedLabel::new(
-                                command.name.clone(),
-                                matching_command.positions.clone(),
-                            )
-                            .truncate(),
-                        )
+                        .child(HighlightedLabel::new(display_name, positions).truncate())
                         .child(
                             h_flex()
                                 .flex_shrink_0()
@@ -821,7 +876,7 @@ impl PickerDelegate for CommandPaletteDelegate {
 
         let focus_handle = &self.previous_focus_handle;
         let keybinding_buttons = if keybind.has_binding(window) {
-            Button::new("change", "Change Keybinding…")
+            Button::new("change", ui::tr("Change Keybinding…"))
                 .key_binding(
                     KeyBinding::for_action_in(&menu::SecondaryConfirm, focus_handle, cx)
                         .map(|kb| kb.size(rems_from_px(12_f32))),
@@ -951,6 +1006,176 @@ mod tests {
     use project::Project;
     use settings::KeymapFile;
     use workspace::{AppState, MultiWorkspace, Workspace};
+
+    fn localized_test_commands() -> Vec<Command> {
+        [
+            "editor: go to definition",
+            "editor: undo",
+            "untranslated custom command",
+        ]
+        .into_iter()
+        .map(|name| Command {
+            name: name.into(),
+            localize: true,
+            action: Toggle.boxed_clone(),
+            usage: Some(CommandUsage {
+                last_invoked: 123,
+                invocations: 7,
+            }),
+        })
+        .collect()
+    }
+
+    fn match_localized_commands(commands: &[Command], query: &str) -> Vec<StringMatch> {
+        let mut matches = fuzzy_nucleo::match_strings(
+            &command_candidates(commands),
+            &normalize_action_query(query),
+            fuzzy_nucleo::Case::Smart,
+            fuzzy_nucleo::LengthPenalty::On,
+            10000,
+        );
+        deduplicate_command_matches(&mut matches);
+        matches
+    }
+
+    #[test]
+    fn test_multilingual_command_queries_preserve_original_names() {
+        let commands = localized_test_commands();
+        let names = commands
+            .iter()
+            .map(|command| command.name.clone())
+            .collect::<Vec<_>>();
+        let aliases = ui::search_texts(commands[0].name.as_ref());
+        assert_ne!(aliases[0], aliases[1]);
+        assert_ne!(aliases[0], aliases[2]);
+
+        for (query, alias_index) in [
+            ("editor::GoToDefinition", 0),
+            ("跳转定义", 1),
+            ("跳轉定義", 2),
+        ] {
+            let matches = match_localized_commands(&commands, query);
+            assert_eq!(matches.len(), 1, "query: {query}");
+            let matched = &matches[0];
+            assert_eq!(matched.candidate_id, 0, "query: {query}");
+            assert_eq!(matched.string.as_ref(), aliases[alias_index]);
+            assert!(!matched.positions.is_empty());
+            assert!(matched.positions.iter().all(|&position| {
+                position < matched.string.len() && matched.string.is_char_boundary(position)
+            }));
+        }
+
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.name.clone())
+                .collect::<Vec<_>>(),
+            names
+        );
+        assert!(commands.iter().all(|command| command.usage
+            == Some(CommandUsage {
+                last_invoked: 123,
+                invocations: 7,
+            })));
+    }
+
+    #[test]
+    fn test_multilingual_command_results_have_unique_command_ids() {
+        let commands = localized_test_commands();
+        let candidates = command_candidates(&commands);
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.id == 2)
+                .count(),
+            1
+        );
+        let unique_aliases = candidates
+            .iter()
+            .map(|candidate| (candidate.id, candidate.string.clone()))
+            .collect::<HashSet<_>>();
+        assert_eq!(unique_aliases.len(), candidates.len());
+
+        for (query, expected_ids) in [("", vec![0, 1, 2]), ("editor", vec![0, 1])] {
+            let matches = match_localized_commands(&commands, query);
+            let mut ids = matches
+                .iter()
+                .map(|matched| matched.candidate_id)
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            assert_eq!(ids, expected_ids);
+        }
+
+        let aliases = ui::search_texts(commands[0].name.as_ref());
+        let mut matches = vec![
+            StringMatch {
+                candidate_id: 0,
+                score: 10.0,
+                positions: vec![0],
+                string: aliases[1].to_owned().into(),
+            },
+            StringMatch {
+                candidate_id: 0,
+                score: 5.0,
+                positions: vec![1],
+                string: aliases[0].to_owned().into(),
+            },
+            StringMatch {
+                candidate_id: 1,
+                score: 1.0,
+                positions: vec![],
+                string: commands[1].name.clone(),
+            },
+        ];
+        deduplicate_command_matches(&mut matches);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].string.as_ref(), aliases[1]);
+        assert_eq!(matches[0].score, 10.0);
+    }
+
+    #[test]
+    fn test_multilingual_command_highlights_only_use_visible_text_offsets() {
+        let commands = localized_test_commands();
+        let aliases = ui::search_texts(commands[0].name.as_ref());
+        let english_matches = match_localized_commands(&commands, "go definition");
+        let simplified_matches = match_localized_commands(&commands, "跳转定义");
+        let traditional_matches = match_localized_commands(&commands, "跳轉定義");
+
+        assert!(!visible_highlight_positions(&english_matches[0], aliases[0]).is_empty());
+        assert!(visible_highlight_positions(&english_matches[0], aliases[1]).is_empty());
+        assert!(visible_highlight_positions(&traditional_matches[0], aliases[1]).is_empty());
+        assert_eq!(
+            visible_highlight_positions(&simplified_matches[0], aliases[1]),
+            simplified_matches[0].positions
+        );
+        assert_eq!(
+            visible_highlight_positions(&traditional_matches[0], aliases[2]),
+            traditional_matches[0].positions
+        );
+    }
+
+    #[test]
+    fn test_multilingual_intercepted_command_preserves_custom_text() {
+        let original: SharedString = "editor: go to definition".into();
+        let command = Command::intercepted(original.clone(), Toggle.boxed_clone());
+        assert_ne!(ui::search_texts(original.as_ref())[1], original.as_ref());
+        assert!(!command.localize);
+        assert_eq!(CommandPaletteDelegate::display_name(&command), original);
+        assert_eq!(command.name, original);
+        assert!(command.usage.is_none());
+
+        let candidates = command_candidates(std::slice::from_ref(&command));
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].string, original);
+        assert!(match_localized_commands(std::slice::from_ref(&command), "跳转定义").is_empty());
+        let matches = match_localized_commands(std::slice::from_ref(&command), "go definition");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].string, original);
+        assert_eq!(
+            visible_highlight_positions(&matches[0], &original),
+            matches[0].positions
+        );
+    }
 
     #[test]
     fn test_humanize_action_name() {
@@ -1378,6 +1603,7 @@ mod tests {
                 .enumerate()
                 .map(|(index, (name, action))| Command {
                     name: SharedString::from(name),
+                    localize: true,
                     action,
                     usage: (index < 2).then_some(CommandUsage {
                         last_invoked: 0,

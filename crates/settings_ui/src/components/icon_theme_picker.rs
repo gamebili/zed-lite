@@ -4,7 +4,7 @@ use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{AnyElement, App, Context, DismissEvent, SharedString, Task, Window};
 use picker::{Picker, PickerDelegate};
 use theme::ThemeRegistry;
-use ui::{ListItem, ListItemSpacing, prelude::*};
+use ui::{ListItem, ListItemSpacing, prelude::*, tr};
 
 type IconThemePicker = Picker<IconThemePickerDelegate>;
 
@@ -82,7 +82,7 @@ impl PickerDelegate for IconThemePickerDelegate {
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        "Search icon themes…".into()
+        tr("Search icon themes…").to_string().into()
     }
 
     fn update_matches(

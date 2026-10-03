@@ -2520,17 +2520,29 @@ pub enum PromptButton {
 impl PromptButton {
     /// Create a button with label
     pub fn new(label: impl Into<SharedString>) -> Self {
-        PromptButton::Other(label.into())
+        PromptButton::Other(label.into()).localize_for(i18n::language())
     }
 
     /// Create an Ok button
     pub fn ok(label: impl Into<SharedString>) -> Self {
-        PromptButton::Ok(label.into())
+        PromptButton::Ok(label.into()).localize_for(i18n::language())
     }
 
     /// Create a Cancel button
     pub fn cancel(label: impl Into<SharedString>) -> Self {
-        PromptButton::Cancel(label.into())
+        PromptButton::Cancel(label.into()).localize_for(i18n::language())
+    }
+
+    fn localize_for(mut self, language: i18n::Language) -> Self {
+        let label = match &mut self {
+            PromptButton::Ok(label) | PromptButton::Cancel(label) | PromptButton::Other(label) => {
+                label
+            }
+        };
+        if let Some(localized) = i18n::lookup_for(language, label.as_ref()) {
+            *label = localized.into();
+        }
+        self
     }
 
     /// Returns true if this button is a cancel button.
@@ -2551,11 +2563,62 @@ impl PromptButton {
 
 impl From<&str> for PromptButton {
     fn from(value: &str) -> Self {
-        match value.to_lowercase().as_str() {
+        let button = match value.to_lowercase().as_str() {
             "ok" => PromptButton::Ok("OK".into()),
             "cancel" => PromptButton::Cancel("Cancel".into()),
             _ => PromptButton::Other(SharedString::from(value.to_owned())),
+        };
+        button.localize_for(i18n::language())
+    }
+}
+
+#[cfg(test)]
+mod prompt_button_tests {
+    use super::PromptButton;
+    use i18n::Language;
+
+    #[test]
+    fn localized_buttons_keep_their_roles() {
+        for (language, ok_label, cancel_label) in [
+            (Language::English, "OK", "Cancel"),
+            (Language::SimplifiedChinese, "确定", "取消"),
+            (Language::TraditionalChinese, "確定", "取消"),
+        ] {
+            let ok = PromptButton::Ok("OK".into()).localize_for(language);
+            assert!(matches!(ok, PromptButton::Ok(_)));
+            assert_eq!(ok.label().as_str(), ok_label);
+
+            let cancel = PromptButton::Cancel("Cancel".into()).localize_for(language);
+            assert!(cancel.is_cancel());
+            assert_eq!(cancel.label().as_str(), cancel_label);
+
+            let other = PromptButton::Other("Cancel".into()).localize_for(language);
+            assert!(matches!(other, PromptButton::Other(_)));
+            assert_eq!(other.label().as_str(), cancel_label);
         }
+    }
+
+    #[test]
+    fn untranslated_button_labels_are_preserved() {
+        let original = "save-response.txt";
+        let button = PromptButton::Other(original.into()).localize_for(Language::SimplifiedChinese);
+        assert_eq!(button.label().as_str(), original);
+    }
+
+    #[test]
+    fn button_roles_are_selected_from_the_original_label() {
+        for label in ["ok", "OK", "Ok"] {
+            assert!(matches!(PromptButton::from(label), PromptButton::Ok(_)));
+        }
+        for label in ["cancel", "Cancel", "CANCEL"] {
+            assert!(PromptButton::from(label).is_cancel());
+        }
+        assert!(matches!(
+            PromptButton::new("Cancel"),
+            PromptButton::Other(_)
+        ));
+        assert!(matches!(PromptButton::ok("Cancel"), PromptButton::Ok(_)));
+        assert!(PromptButton::cancel("OK").is_cancel());
     }
 }
 

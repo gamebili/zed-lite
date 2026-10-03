@@ -1,5 +1,5 @@
 use gpui::{IntoElement, ParentElement, Role, Styled};
-use ui::{Divider, DividerColor, prelude::*};
+use ui::{Divider, DividerColor, prelude::*, tr};
 
 #[derive(IntoElement)]
 pub struct SettingsSectionHeader {
@@ -21,7 +21,7 @@ impl SettingsSectionHeader {
 impl RenderOnce for SettingsSectionHeader {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let label_text = self.label.clone();
-        let label = Label::new(self.label)
+        let label = Label::new(tr(self.label))
             .size(LabelSize::Small)
             .color(Color::Muted)
             .buffer_font(cx);
@@ -30,7 +30,7 @@ impl RenderOnce for SettingsSectionHeader {
             .id(label_text.clone())
             .role(Role::Heading)
             .aria_level(2)
-            .aria_label(label_text)
+            .aria_label(tr(label_text))
             .w_full()
             .when(!self.no_padding, |this| this.px_8())
             .gap_1p5()

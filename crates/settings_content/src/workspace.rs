@@ -13,6 +13,10 @@ use crate::{
 #[with_fallible_options]
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct WorkspaceSettingsContent {
+    /// The language used for Zed's interface. `system` follows the operating system's display language.
+    ///
+    /// Default: system
+    pub ui_language: Option<UiLanguage>,
     /// Active pane styling settings.
     pub active_pane_modifiers: Option<ActivePaneModifiers>,
     /// The text rendering mode to use.
@@ -172,6 +176,48 @@ pub struct WorkspaceSettingsContent {
     /// Whether the focused panel follows the mouse location
     /// Default: false
     pub focus_follows_mouse: Option<FocusFollowsMouse>,
+}
+
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+    strum::EnumMessage,
+)]
+pub enum UiLanguage {
+    #[default]
+    #[serde(rename = "system")]
+    #[strum(message = "Follow System")]
+    System,
+    #[serde(rename = "en")]
+    #[strum(message = "English")]
+    English,
+    #[serde(rename = "zh-CN")]
+    #[strum(message = "简体中文")]
+    SimplifiedChinese,
+    #[serde(rename = "zh-TW")]
+    #[strum(message = "繁體中文")]
+    TraditionalChinese,
+}
+
+impl UiLanguage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::English => "en",
+            Self::SimplifiedChinese => "zh-CN",
+            Self::TraditionalChinese => "zh-TW",
+        }
+    }
 }
 
 #[with_fallible_options]

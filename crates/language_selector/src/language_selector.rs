@@ -202,7 +202,7 @@ impl PickerDelegate for LanguageSelectorDelegate {
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        "Select a language…".into()
+        ui::tr("Select a language…").into()
     }
 
     fn match_count(&self) -> usize {

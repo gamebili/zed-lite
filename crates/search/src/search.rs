@@ -158,7 +158,9 @@ impl SearchOption {
         })
         .shape(IconButtonShape::Square)
         .toggle_state(active.contains(self.as_options()))
-        .tooltip(move |_window, cx| Tooltip::for_action_in(label, action, &focus_handle, cx))
+        .tooltip(move |_window, cx| {
+            Tooltip::for_action_in(ui::tr(label), action, &focus_handle, cx)
+        })
     }
 }
 
@@ -233,7 +235,11 @@ pub(crate) fn show_no_more_matches(window: &mut Window, cx: &mut App) {
         };
         workspace.update(cx, |workspace, cx| {
             workspace.show_toast(
-                Toast::new(notification_id.clone(), "No more matches").autohide(),
+                Toast::new(
+                    notification_id.clone(),
+                    ui::localized_text("No more matches"),
+                )
+                .autohide(),
                 cx,
             );
         })

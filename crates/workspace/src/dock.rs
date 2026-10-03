@@ -1476,7 +1476,7 @@ impl Render for PanelButtons {
                                     let dock_for_flex = dock_for_menu.clone();
                                     let workspace_for_flex = workspace_for_menu.clone();
                                     menu = menu.toggleable_entry(
-                                        "Flex Width",
+                                        ui::tr("Flex Width"),
                                         currently_flexible,
                                         IconPosition::Start,
                                         None,
@@ -1499,7 +1499,7 @@ impl Render for PanelButtons {
                                     let dock_for_fixed = dock_for_menu.clone();
                                     let workspace_for_fixed = workspace_for_menu.clone();
                                     menu = menu.toggleable_entry(
-                                        "Fixed Width",
+                                        ui::tr("Fixed Width"),
                                         !currently_flexible,
                                         IconPosition::Start,
                                         None,

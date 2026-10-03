@@ -1033,6 +1033,7 @@ impl VsCodeSettings {
 
     fn workspace_settings_content(&self) -> WorkspaceSettingsContent {
         WorkspaceSettingsContent {
+            ui_language: None,
             active_pane_modifiers: self.active_pane_modifiers(),
             accessible_mode: None,
             text_rendering_mode: None,

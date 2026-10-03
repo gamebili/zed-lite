@@ -4,7 +4,7 @@ use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{AnyElement, App, Context, DismissEvent, SharedString, Task, Window};
 use picker::{Picker, PickerDelegate};
 use theme::FontFamilyCache;
-use ui::{ListItem, ListItemSpacing, prelude::*};
+use ui::{ListItem, ListItemSpacing, prelude::*, tr};
 
 type FontPicker = Picker<FontPickerDelegate>;
 
@@ -74,7 +74,7 @@ impl PickerDelegate for FontPickerDelegate {
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        "Search fonts…".into()
+        tr("Search fonts…").to_string().into()
     }
 
     fn update_matches(

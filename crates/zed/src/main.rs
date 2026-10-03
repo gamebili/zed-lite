@@ -492,6 +492,27 @@ fn main() {
         settings::init(cx);
         zlog_settings::init(cx);
         zed::watch_settings_files(fs.clone(), cx);
+        let ui_language = cx
+            .global::<SettingsStore>()
+            .merged_settings()
+            .workspace
+            .ui_language
+            .unwrap_or_default();
+        i18n::set_language(ui_language.as_str());
+        cx.observe_global::<SettingsStore>(|cx| {
+            let ui_language = cx
+                .global::<SettingsStore>()
+                .merged_settings()
+                .workspace
+                .ui_language
+                .unwrap_or_default();
+            if i18n::set_language(ui_language.as_str()) {
+                let menus = app_menus(cx);
+                cx.set_menus(menus);
+                cx.refresh_windows();
+            }
+        })
+        .detach();
         handle_keymap_file_changes(user_keymap_file_rx, user_keymap_watcher, cx);
 
         let user_agent = format!(

@@ -727,7 +727,7 @@ impl PickerDelegate for Delegate {
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        "Search all files…".into()
+        ui::tr("Search all files…").into()
     }
 
     fn searchbar_trailer(
@@ -788,18 +788,21 @@ impl PickerDelegate for Delegate {
     ) -> Vec<picker::PickerAction> {
         use gpui::Action as _;
         vec![
-            picker::PickerAction::header("Split…"),
+            picker::PickerAction::header(ui::tr("Split…")),
             picker::PickerAction::button(
-                "Left",
+                ui::tr("Left"),
                 workspace::pane::SplitLeft::default().boxed_clone(),
             ),
             picker::PickerAction::button(
-                "Right",
+                ui::tr("Right"),
                 workspace::pane::SplitRight::default().boxed_clone(),
             ),
-            picker::PickerAction::button("Up", workspace::pane::SplitUp::default().boxed_clone()),
             picker::PickerAction::button(
-                "Down",
+                ui::tr("Up"),
+                workspace::pane::SplitUp::default().boxed_clone(),
+            ),
+            picker::PickerAction::button(
+                ui::tr("Down"),
                 workspace::pane::SplitDown::default().boxed_clone(),
             ),
             picker::PickerAction::separator(),
@@ -811,7 +814,10 @@ impl PickerDelegate for Delegate {
                 },
                 menu::Confirm.boxed_clone(),
             ),
-            picker::PickerAction::button("Open as Tab", super::ToProjectSearch.boxed_clone()),
+            picker::PickerAction::button(
+                ui::tr("Open as Tab"),
+                super::ToProjectSearch.boxed_clone(),
+            ),
         ]
     }
 

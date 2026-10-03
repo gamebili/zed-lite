@@ -427,7 +427,7 @@ impl Item for BranchDiff {
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
         match self.diff_base(cx) {
             DiffBase::Merge { base_ref } => format!("Changes since {}", base_ref).into(),
-            DiffBase::Head | DiffBase::Index | DiffBase::Staged => "Changes".into(),
+            DiffBase::Head | DiffBase::Index | DiffBase::Staged => ui::tr("Changes").into(),
         }
     }
 
@@ -796,7 +796,7 @@ impl Render for BranchDiffToolbar {
                                 .size(IconSize::XSmall)
                                 .color(Color::Muted),
                         ),
-                        Tooltip::text("Select Base Branch"),
+                        Tooltip::text(ui::tr("Select Base Branch")),
                     ),
             )
     }

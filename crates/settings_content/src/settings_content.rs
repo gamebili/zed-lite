@@ -1622,3 +1622,45 @@ impl std::str::FromStr for DelayMs {
             .with_context(|| format!("failed to parse delay duration: {s}"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{SettingsContent, UiLanguage};
+
+    #[test]
+    fn ui_language_round_trips_at_the_settings_root() -> serde_json::Result<()> {
+        for language in [
+            UiLanguage::System,
+            UiLanguage::English,
+            UiLanguage::SimplifiedChinese,
+            UiLanguage::TraditionalChinese,
+        ] {
+            let json = serde_json::json!({ "ui_language": language.as_str() });
+            let content: SettingsContent = serde_json::from_value(json.clone())?;
+            assert_eq!(content.workspace.ui_language, Some(language));
+            assert_eq!(
+                serde_json::to_value(content)?["ui_language"],
+                json["ui_language"]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn existing_settings_without_ui_language_follow_the_system() -> serde_json::Result<()> {
+        let content: SettingsContent = serde_json::from_value(serde_json::json!({
+            "vim_mode": true,
+            "ui_font_size": 17,
+        }))?;
+        assert_eq!(
+            content.workspace.ui_language.unwrap_or_default(),
+            UiLanguage::System
+        );
+        assert_eq!(content.vim_mode, Some(true));
+        assert_eq!(
+            serde_json::to_value(content)?["ui_font_size"].as_f64(),
+            Some(17.0)
+        );
+        Ok(())
+    }
+}

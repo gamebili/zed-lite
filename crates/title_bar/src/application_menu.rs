@@ -40,6 +40,7 @@ pub enum ActivateDirection {
 
 #[derive(Clone)]
 struct MenuEntry {
+    key: SharedString,
     menu: OwnedMenu,
     handle: PopoverMenuHandle<ContextMenu>,
 }
@@ -56,11 +57,14 @@ impl ApplicationMenu {
 
         let entries = Self::build_entries(menus);
         let mut disable_ai = DisableAiSettings::get_global(cx).disable_ai;
+        let mut language = ui::language();
         let settings_subscription =
             cx.observe_global::<SettingsStore>(move |application_menu, cx| {
                 let new_disable_ai = DisableAiSettings::get_global(cx).disable_ai;
-                if new_disable_ai != disable_ai {
+                let new_language = ui::language();
+                if new_disable_ai != disable_ai || new_language != language {
                     disable_ai = new_disable_ai;
+                    language = new_language;
                     for entry in &application_menu.entries {
                         if entry.handle.is_deployed() {
                             entry.handle.hide(cx);
@@ -68,6 +72,7 @@ impl ApplicationMenu {
                     }
                     let menus = cx.get_menus().unwrap_or_default();
                     application_menu.entries = Self::build_entries(menus);
+                    application_menu.pending_menu_open = None;
                 }
                 cx.notify();
             });
@@ -82,9 +87,28 @@ impl ApplicationMenu {
     fn build_entries(menus: Vec<OwnedMenu>) -> SmallVec<[MenuEntry; 8]> {
         menus
             .into_iter()
-            .map(|menu| MenuEntry {
-                menu,
-                handle: PopoverMenuHandle::default(),
+            .map(|menu| {
+                let key = [
+                    "Zed",
+                    "File",
+                    "Edit",
+                    "Selection",
+                    "Encoding",
+                    "View",
+                    "Go",
+                    "Run",
+                    "Window",
+                    "Help",
+                ]
+                .into_iter()
+                .find(|key| menu.name == *key || menu.name == ui::tr(*key).as_ref())
+                .map(SharedString::new_static)
+                .unwrap_or_else(|| menu.name.clone().into());
+                MenuEntry {
+                    key,
+                    menu,
+                    handle: PopoverMenuHandle::default(),
+                }
             })
             .collect()
     }
@@ -176,7 +200,7 @@ impl ApplicationMenu {
     fn render_application_menu(&self, entry: &MenuEntry) -> impl IntoElement {
         let handle = entry.handle.clone();
 
-        let menu_name = entry.menu.name.clone();
+        let menu_name = entry.key.clone();
         let entry = entry.clone();
 
         // Application menu must have same ids as first menu item in standard menu
@@ -196,8 +220,8 @@ impl ApplicationMenu {
                         .style(ButtonStyle::Subtle)
                         .icon_size(IconSize::Small)
                         .tab_index(0isize)
-                        .aria_label("Application menu"),
-                        Tooltip::text("Open Application Menu"),
+                        .aria_label(ui::tr("Application menu")),
+                        Tooltip::text(ui::tr("Open Application Menu")),
                     )
                     .with_handle(handle),
             )
@@ -206,7 +230,8 @@ impl ApplicationMenu {
     fn render_standard_menu(&self, entry: &MenuEntry) -> impl IntoElement {
         let current_handle = entry.handle.clone();
 
-        let menu_name = entry.menu.name.clone();
+        let menu_name = entry.key.clone();
+        let menu_label = entry.menu.name.clone();
         let entry = entry.clone();
 
         let all_handles: Vec<_> = self
@@ -226,7 +251,7 @@ impl ApplicationMenu {
                     .trigger(
                         Button::new(
                             SharedString::from(format!("{}-menu-trigger", menu_name)),
-                            menu_name,
+                            menu_label,
                         )
                         .style(ButtonStyle::Subtle)
                         .label_size(LabelSize::Small)
@@ -331,13 +356,13 @@ impl Render for ApplicationMenu {
             && let Some(entry) = self
                 .entries
                 .iter()
-                .find(|entry| entry.menu.name == pending_menu_open && !entry.handle.is_deployed())
+                .find(|entry| entry.key == pending_menu_open && !entry.handle.is_deployed())
         {
             let handle_to_show = entry.handle.clone();
             let handles_to_hide: Vec<_> = self
                 .entries
                 .iter()
-                .filter(|e| e.menu.name != pending_menu_open && e.handle.is_deployed())
+                .filter(|e| e.key != pending_menu_open && e.handle.is_deployed())
                 .map(|e| e.handle.clone())
                 .collect();
 

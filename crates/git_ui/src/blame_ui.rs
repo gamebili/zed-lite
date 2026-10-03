@@ -564,13 +564,13 @@ fn deploy_blame_entry_context_menu(
         let blame_previous_revision = blame_entry.previous_revision_target();
         let has_blame_targets = blame_revision.is_some() || blame_previous_revision.is_some();
         menu.on_blur_subscription(Subscription::new(|| {}))
-            .entry("Copy Commit SHA", None, move |_, cx| {
+            .entry(ui::tr("Copy Commit SHA"), None, move |_, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(sha.clone()));
             })
             .when_some(
                 details.and_then(|details| details.permalink.clone()),
                 |this, url| {
-                    this.entry("Open Commit Permalink", None, move |_, cx| {
+                    this.entry(ui::tr("Open Commit Permalink"), None, move |_, cx| {
                         cx.open_url(url.as_str())
                     })
                 },
@@ -579,7 +579,7 @@ fn deploy_blame_entry_context_menu(
             .when_some(blame_revision, |this, (revision, path)| {
                 let repository = repository.clone();
                 let workspace = workspace.clone();
-                this.entry("Blame Revision", None, move |window, cx| {
+                this.entry(ui::tr("Blame Revision"), None, move |window, cx| {
                     open_buffer_blame_at_revision(
                         repository.clone(),
                         workspace.clone(),
@@ -593,16 +593,20 @@ fn deploy_blame_entry_context_menu(
             .when_some(blame_previous_revision, |this, (revision, path)| {
                 let repository = repository.clone();
                 let workspace = workspace.clone();
-                this.entry("Blame Previous Revision", None, move |window, cx| {
-                    open_buffer_blame_at_revision(
-                        repository.clone(),
-                        workspace.clone(),
-                        path.clone(),
-                        revision,
-                        window,
-                        cx,
-                    );
-                })
+                this.entry(
+                    ui::tr("Blame Previous Revision"),
+                    None,
+                    move |window, cx| {
+                        open_buffer_blame_at_revision(
+                            repository.clone(),
+                            workspace.clone(),
+                            path.clone(),
+                            revision,
+                            window,
+                            cx,
+                        );
+                    },
+                )
             })
     });
 

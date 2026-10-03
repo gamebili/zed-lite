@@ -372,14 +372,14 @@ impl Render for LanguageServerPrompt {
                                             .tooltip(move |_window, cx| {
                                                 if suppress {
                                                     Tooltip::with_meta(
-                                                        "Suppress",
+                                                        ui::tr("Suppress"),
                                                         Some(&SuppressNotification),
                                                         "Click to close",
                                                         cx,
                                                     )
                                                 } else {
                                                     Tooltip::with_meta(
-                                                        "Close",
+                                                        ui::tr("Close"),
                                                         Some(&menu::Cancel),
                                                         "Suppress with shift-click",
                                                         cx,
@@ -1009,20 +1009,20 @@ pub mod simple_message_notification {
                             .tooltip(move |_window, cx| {
                                 if suppress {
                                     Tooltip::with_meta(
-                                        "Suppress",
+                                        ui::tr("Suppress"),
                                         Some(&SuppressNotification),
                                         "Click to Close",
                                         cx,
                                     )
                                 } else if show_suppress_button {
                                     Tooltip::with_meta(
-                                        "Close",
+                                        ui::tr("Close"),
                                         Some(&menu::Cancel),
                                         "Shift-click to Suppress",
                                         cx,
                                     )
                                 } else {
-                                    Tooltip::for_action("Close", &menu::Cancel, cx)
+                                    Tooltip::for_action(ui::tr("Close"), &menu::Cancel, cx)
                                 }
                             })
                             .on_click(cx.listener(move |_, _, _, cx| {

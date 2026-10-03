@@ -1688,7 +1688,7 @@ impl PickerDelegate for FileFinderDelegate {
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        "Search project files...".into()
+        ui::tr("Search project files...").into()
     }
 
     fn searchbar_trailer(
@@ -1710,7 +1710,12 @@ impl PickerDelegate for FileFinderDelegate {
             .icon_size(IconSize::Small)
             .toggle_state(including_ignored)
             .tooltip(move |_window, cx| {
-                Tooltip::for_action_in(tooltip_label, &ToggleIncludeIgnored, &focus_handle, cx)
+                Tooltip::for_action_in(
+                    ui::tr(tooltip_label),
+                    &ToggleIncludeIgnored,
+                    &focus_handle,
+                    cx,
+                )
             })
             .on_click(|_, window, cx| {
                 window.dispatch_action(ToggleIncludeIgnored.boxed_clone(), cx)
@@ -1999,16 +2004,19 @@ impl PickerDelegate for FileFinderDelegate {
         _cx: &mut Context<Picker<Self>>,
     ) -> Vec<picker::PickerAction> {
         let open_label: SharedString = if self.selected_matches.len() > 1 {
-            "Open multiple".into()
+            ui::tr("Open multiple")
         } else {
-            "Open File".into()
+            ui::tr("Open File")
         };
         vec![
-            picker::PickerAction::header("Split…"),
-            picker::PickerAction::button("Left", pane::SplitLeft::default().boxed_clone()),
-            picker::PickerAction::button("Right", pane::SplitRight::default().boxed_clone()),
-            picker::PickerAction::button("Up", pane::SplitUp::default().boxed_clone()),
-            picker::PickerAction::button("Down", pane::SplitDown::default().boxed_clone()),
+            picker::PickerAction::header(ui::tr("Split…")),
+            picker::PickerAction::button(ui::tr("Left"), pane::SplitLeft::default().boxed_clone()),
+            picker::PickerAction::button(
+                ui::tr("Right"),
+                pane::SplitRight::default().boxed_clone(),
+            ),
+            picker::PickerAction::button(ui::tr("Up"), pane::SplitUp::default().boxed_clone()),
+            picker::PickerAction::button(ui::tr("Down"), pane::SplitDown::default().boxed_clone()),
             picker::PickerAction::separator(),
             picker::PickerAction::button(open_label, menu::Confirm.boxed_clone()),
         ]
