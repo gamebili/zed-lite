@@ -289,6 +289,7 @@ fn legacy_compound_streams_show_paged_actual_data_and_preserve_source() -> Resul
     }
     let before = fs::read(&path)?;
     let page = read(&path, &PreviewRequest::default())?;
+    assert!(!page.is_hex);
     assert_eq!(page.sections, ["/Workbook"]);
     assert_eq!(page.rows.len(), PAGE_ROWS);
     assert_eq!(page.next_offset, Some((PAGE_ROWS * 32) as u64));
@@ -323,15 +324,173 @@ fn huge_legacy_source_opens_with_bounded_pages() -> Result<()> {
     let path = directory.path().join("huge.xls");
     let mut file = File::create(&path)?;
     file.write_all(OLE_SIGNATURE)?;
-    file.set_len(128 * 1024 * 1024 * 1024u64)?;
-    let page = read(&path, &PreviewRequest::default())?;
+    let size = 128 * 1024 * 1024 * 1024u64;
+    file.set_len(size)?;
+    let page = crate::read(
+        &path,
+        &PreviewRequest {
+            section: Some("Sheet: Missing".into()),
+            offset: 200,
+        },
+    )?;
+    assert!(page.is_hex);
+    assert_eq!(page.title, "Hex");
+    assert!(page.sections.is_empty());
     assert_eq!(page.rows.len(), PAGE_ROWS);
-    assert_eq!(page.next_offset, Some(6400));
+    assert_eq!(page.next_offset, Some((PAGE_ROWS * 16) as u64));
+    assert_eq!(
+        page.rows.first().and_then(|row| row.first()),
+        Some(&"0000000000000000".into())
+    );
+    assert!(
+        page.metadata
+            .contains(&("File bytes".into(), size.to_string()))
+    );
     assert!(
         page.note
             .context("structural limit note")?
             .contains("structural parsing limit")
     );
+    let next = crate::read_bytes(
+        &path,
+        &PreviewRequest {
+            offset: page.next_offset.context("Hex next offset")?,
+            ..Default::default()
+        },
+    )?;
+    assert!(next.is_hex);
+    assert_eq!(
+        next.rows.first().and_then(|row| row.first()),
+        Some(&"0000000000000C80".into())
+    );
+    assert_eq!(file.metadata()?.len(), size);
+    Ok(())
+}
+
+#[test]
+fn unrecognized_office_variants_open_as_file_hex_instead_of_pseudo_text() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let source = vec![0xf7; PAGE_ROWS * 16 + 19];
+    for extension in ["docx", "docm", "wps"] {
+        let path = directory.path().join(format!("unknown.{extension}"));
+        fs::write(&path, &source)?;
+        let page = crate::read(
+            &path,
+            &PreviewRequest {
+                section: Some("Unavailable section".into()),
+                offset: 200,
+            },
+        )?;
+        assert!(page.is_hex);
+        assert_eq!(page.title, "Hex");
+        assert!(page.sections.is_empty());
+        assert_eq!(page.columns, ["Offset", "Hexadecimal", "ASCII"]);
+        assert_eq!(page.rows.len(), PAGE_ROWS);
+        assert_eq!(page.next_offset, Some((PAGE_ROWS * 16) as u64));
+        assert_eq!(
+            page.rows.first().and_then(|row| row.first()),
+            Some(&"0000000000000000".into())
+        );
+        assert_eq!(
+            page.rows.first().and_then(|row| row.get(1)),
+            Some(&"F7 ".repeat(16))
+        );
+        assert!(
+            page.note
+                .context("unrecognized Office format note")?
+                .contains("no recognized XML or compound container")
+        );
+        assert!(
+            page.metadata
+                .contains(&("File bytes".into(), source.len().to_string()))
+        );
+        assert_eq!(fs::read(&path)?, source);
+    }
+    Ok(())
+}
+
+#[test]
+fn recognized_legacy_word_and_wps_streams_keep_content_sections() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    for extension in ["doc", "wps"] {
+        let path = directory.path().join(format!("legacy.{extension}"));
+        {
+            let mut compound = cfb::create(&path)?;
+            compound
+                .create_stream("/WordDocument")?
+                .write_all(b"Actual Word or WPS document text!")?;
+        }
+        let before = fs::read(&path)?;
+        let page = read(&path, &PreviewRequest::default())?;
+        assert!(!page.is_hex);
+        assert_eq!(page.sections, ["/WordDocument"]);
+        assert!(
+            page.rows
+                .first()
+                .and_then(|row| row.get(2))
+                .context("legacy document text")?
+                .contains("Actual Word or WPS")
+        );
+        assert_eq!(fs::read(&path)?, before);
+    }
+    let path = directory.path().join("legacy.wps");
+    zip_document(&path, &[("Document/body.dat", "Actual WPS stream text")])?;
+    let before = fs::read(&path)?;
+    let page = crate::read(&path, &PreviewRequest::default())?;
+    assert!(!page.is_hex);
+    assert_eq!(page.sections, ["Document/body.dat"]);
+    assert!(
+        page.rows
+            .first()
+            .and_then(|row| row.get(2))
+            .context("WPS archive document text")?
+            .contains("Actual WPS stream text")
+    );
+    assert_eq!(fs::read(&path)?, before);
+    Ok(())
+}
+
+#[test]
+fn compound_parent_path_budgets_fall_back_to_hex_before_directory_walks() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let deep_path = (0..12)
+        .map(|depth| format!("level{depth}"))
+        .collect::<Vec<_>>()
+        .join("/");
+    let name = "中".repeat(31);
+    let long_path = [name.as_str(); 3].join("/");
+    for (index, storage_path) in [deep_path, long_path].iter().enumerate() {
+        let path = directory.path().join(format!("directory{index}.wps"));
+        {
+            let mut compound = cfb::create(&path)?;
+            let storage_path = format!("/{storage_path}");
+            compound.create_storage_all(&storage_path)?;
+            compound
+                .create_stream(format!("{storage_path}/WordDocument"))?
+                .write_all(b"Actual document stream text")?;
+        }
+        let before = fs::read(&path)?;
+        assert!(read(&path, &PreviewRequest::default()).is_err());
+        let page = crate::read(
+            &path,
+            &PreviewRequest {
+                section: Some("Unavailable section".into()),
+                offset: 200,
+            },
+        )?;
+        assert!(page.is_hex);
+        assert!(page.sections.is_empty());
+        assert_eq!(
+            page.rows.first().and_then(|row| row.first()),
+            Some(&"0000000000000000".into())
+        );
+        assert!(
+            page.note
+                .context("compound directory budget note")?
+                .contains("Structured preview failed:")
+        );
+        assert_eq!(fs::read(&path)?, before);
+    }
     Ok(())
 }
 
@@ -547,7 +706,7 @@ fn worksheet_names_do_not_collide_with_preview_controls() -> Result<()> {
             }
         )?
         .title,
-        "File bytes"
+        "Hex"
     );
     assert_eq!(fs::read(&path)?, before);
     let path = directory.path().join("controls.ods");

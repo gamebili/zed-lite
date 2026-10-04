@@ -1490,16 +1490,15 @@ fn archive_stream(
     Ok(page)
 }
 
-fn compound(file: File, request: &PreviewRequest, deadline: Instant) -> Result<PreviewPage> {
+fn compound(
+    path: &Path,
+    file: File,
+    request: &PreviewRequest,
+    deadline: Instant,
+) -> Result<PreviewPage> {
     if file.metadata()?.len() > COMPOUND_BYTES {
-        let mut file = file;
-        file.seek(SeekFrom::Start(request.offset.min(file.metadata()?.len())))?;
-        let mut page = stream_page(
-            &mut BoundedReader::new(file, READ_BYTES, deadline),
-            request,
-            "Legacy Office document bytes",
-        )?;
-        page.note = Some("This compound document exceeds the 32 MiB structural parsing limit. Actual file bytes are paged read-only; use an Office converter for worksheet or slide layout. The limit prevents large FAT and MiniFAT allocations.".into());
+        let mut page = crate::read_bytes(path, &PreviewRequest::default())?;
+        page.note = Some("This compound document exceeds the 32 MiB structural parsing limit. Actual file bytes are shown as Hex from offset 0; use an Office converter for worksheet or slide layout. The limit prevents large FAT and MiniFAT allocations.".into());
         return Ok(page);
     }
     // The parser preallocates MiniFAT chains before reading them, so a read
@@ -1510,19 +1509,10 @@ fn compound(file: File, request: &PreviewRequest, deadline: Instant) -> Result<P
         BoundedReader::new(file, XML_BYTES, deadline),
     ))
     .context("Invalid Office compound document")?;
-    let mut sections = Vec::new();
-    let mut names_bytes = 0usize;
-    for entry in compound.walk() {
-        if entry.is_stream() {
-            let name = entry.path().to_string_lossy().into_owned();
-            names_bytes = names_bytes.saturating_add(name.len());
-            ensure!(
-                sections.len() < ARCHIVE_ENTRIES as usize && names_bytes <= PAGE_BYTES,
-                "Office compound directory exceeds the bounded preview limit"
-            );
-            sections.push(name);
-        }
-    }
+    let mut sections = crate::inspect::compound_streams(&compound)?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
     ensure!(
         !sections
             .iter()
@@ -1586,7 +1576,7 @@ pub(crate) fn read(path: &Path, request: &PreviewRequest) -> Result<PreviewPage>
     let header_length = file.read(&mut header)?;
     file.rewind()?;
     let mut page = if header_length == 8 && &header == OLE_SIGNATURE {
-        compound(file, request, deadline)?
+        compound(path, file, request, deadline)?
     } else if header.starts_with(b"PK") {
         let mut archive = open_zip(file, deadline)?;
         if archive.index_for_name("xl/workbook.xml").is_some() {
@@ -1605,13 +1595,8 @@ pub(crate) fn read(path: &Path, request: &PreviewRequest) -> Result<PreviewPage>
             archive_stream(&mut archive, request, deadline)?
         }
     } else {
-        file.seek(SeekFrom::Start(request.offset.min(before.0)))?;
-        let mut page = stream_page(
-            &mut BoundedReader::new(file, READ_BYTES, deadline),
-            request,
-            "Office document bytes",
-        )?;
-        page.note = Some("This Office or WPS variant has no recognized XML or compound container. Actual document bytes are available read-only; install an appropriate document converter for layout rendering.".into());
+        let mut page = crate::read_bytes(path, &PreviewRequest::default())?;
+        page.note = Some("This Office or WPS variant has no recognized XML or compound container. Actual document bytes are shown as Hex from offset 0; install an appropriate document converter for layout rendering.".into());
         page
     };
     ensure!(

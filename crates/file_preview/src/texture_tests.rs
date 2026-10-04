@@ -208,19 +208,72 @@ fn ktx2_bgra_channel_order_is_preserved() -> Result<()> {
 }
 
 #[test]
-fn basis_supercompression_retains_readable_mip_index() -> Result<()> {
-    let file = tempfile::NamedTempFile::new()?;
-    std::fs::write(file.path(), ktx2_fixture(8192, 8192, 0, 1, &[&[1, 2, 3]]))?;
-    for request in [PreviewRequest::default(), mip_request(0)] {
-        let page = read(file.path(), &request)?;
-        assert_eq!(page.rows.len(), 1);
+fn basis_supercompression_opens_as_hex_and_keeps_byte_page_offsets() -> Result<()> {
+    let file = tempfile::NamedTempFile::with_suffix(".ktx2")?;
+    let payload = (0..crate::PAGE_ROWS * 16 * 2 + 37)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let source = ktx2_fixture(8192, 8192, 0, 1, &[&payload]);
+    std::fs::write(file.path(), &source)?;
+    let hex_bytes = |page: &PreviewPage| -> Result<Vec<u8>> {
+        page.rows
+            .iter()
+            .map(|row| row.get(1).context("Missing hexadecimal row"))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flat_map(|cell| cell.split_whitespace())
+            .map(|value| u8::from_str_radix(value, 16).map_err(anyhow::Error::from))
+            .collect()
+    };
+    for request in [
+        PreviewRequest::default(),
+        mip_request(0),
+        PreviewRequest {
+            section: Some("Mip 0".into()),
+            offset: 200,
+        },
+    ] {
+        let page = crate::read(file.path(), &request)?;
+        assert!(page.is_hex);
+        assert_eq!(page.title, "Hex");
+        assert!(page.sections.is_empty());
+        assert_eq!(page.rows.len(), crate::PAGE_ROWS);
         assert!(page.image.is_none());
+        assert_eq!(hex_bytes(&page)?, source[..crate::PAGE_ROWS * 16]);
+        assert_eq!(page.next_offset, Some((crate::PAGE_ROWS * 16) as u64));
+        assert!(
+            page.metadata
+                .contains(&("Format".into(), "Vulkan format 0".into()))
+        );
         assert!(
             page.note
                 .context("transcoder note")?
                 .contains("supercompression")
         );
     }
+    let mut bytes = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = crate::read_bytes(
+            file.path(),
+            &PreviewRequest {
+                offset,
+                ..Default::default()
+            },
+        )?;
+        assert!(page.is_hex);
+        assert_eq!(
+            page.rows.first().and_then(|row| row.first()),
+            Some(&format!("{offset:016X}"))
+        );
+        bytes.extend(hex_bytes(&page)?);
+        match page.next_offset {
+            Some(next) => offset = next,
+            None => break,
+        }
+    }
+    assert_eq!(bytes, source);
+    assert_eq!(std::fs::read(file.path())?, source);
     Ok(())
 }
 
@@ -293,6 +346,8 @@ fn sparse_large_texture_refuses_large_mip_but_reads_smaller_mip() -> Result<()> 
     writer.seek(SeekFrom::Start(size - 4))?;
     writer.write_all(&[13, 14, 15, 255])?;
     let large = read(file.path(), &mip_request(0))?;
+    assert!(!large.is_hex);
+    assert!(large.sections.contains(&"Mip 13".into()));
     assert!(large.image.is_none());
     assert!(
         large
@@ -341,9 +396,34 @@ fn unknown_pvr_encoding_preserves_declared_metadata() -> Result<()> {
     let file = tempfile::NamedTempFile::new()?;
     std::fs::write(file.path(), pvr_fixture(512, 512, 99, 3, &[]))?;
     let page = read(file.path(), &PreviewRequest::default())?;
+    assert!(page.is_hex);
+    assert_eq!(page.title, "Hex");
+    assert!(page.sections.is_empty());
     assert!(page.image.is_none());
     assert!(page.metadata.contains(&("Mip levels".into(), "3".into())));
     assert!(page.note.context("format note")?.contains("transcoder"));
+    Ok(())
+}
+
+#[test]
+fn supported_volume_retains_mip_sections_instead_of_becoming_unsupported_hex() -> Result<()> {
+    let file = tempfile::NamedTempFile::new()?;
+    let mut source = ktx2_fixture(1, 1, 37, 0, &[&[10, 20, 30, 255]]);
+    word(&mut source, 28, 2, true);
+    std::fs::write(file.path(), source)?;
+    for request in [PreviewRequest::default(), mip_request(0)] {
+        let page = read(file.path(), &request)?;
+        assert!(!page.is_hex);
+        assert_eq!(page.sections, ["Overview", "Mip 0"]);
+        assert!(page.image.is_none());
+        if request.section.is_some() {
+            assert!(
+                page.note
+                    .context("volume note")?
+                    .contains("Volume textures")
+            );
+        }
+    }
     Ok(())
 }
 

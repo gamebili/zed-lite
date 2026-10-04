@@ -197,6 +197,21 @@ pub trait ProjectItem: 'static {
     ) -> Option<Task<Result<Entity<Self>>>>
     where
         Self: Sized;
+
+    fn try_open_async(
+        project: &Entity<Project>,
+        path: &ProjectPath,
+        cx: &mut App,
+    ) -> Task<Result<Option<Entity<Self>>>>
+    where
+        Self: Sized,
+    {
+        match Self::try_open(project, path, cx) {
+            Some(task) => cx.spawn(async move |_| task.await.map(Some)),
+            None => Task::ready(Ok(None)),
+        }
+    }
+
     fn entry_id(&self, cx: &App) -> Option<ProjectEntryId>;
     fn project_path(&self, cx: &App) -> Option<ProjectPath>;
     fn is_dirty(&self) -> bool;

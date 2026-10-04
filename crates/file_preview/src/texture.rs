@@ -711,6 +711,18 @@ pub(crate) fn read(path: &Path, request: &PreviewRequest) -> Result<PreviewPage>
         note: texture.note,
         ..Default::default()
     };
+    if texture.encoding.is_none() {
+        let mut hex = crate::read_bytes(path, &PreviewRequest::default())?;
+        hex.metadata.extend(page.metadata);
+        hex.note = Some(format!(
+            "Unsupported texture encoding {}. {} Showing raw file bytes from offset 0.",
+            texture.format,
+            page.note
+                .as_deref()
+                .unwrap_or("This pixel encoding requires a texture transcoder.")
+        ));
+        return Ok(hex);
+    }
     if selected == "Overview" {
         page.rows = texture
             .levels
@@ -764,9 +776,6 @@ pub(crate) fn read(path: &Path, request: &PreviewRequest) -> Result<PreviewPage>
                 }
             }
         }
-    }
-    if texture.encoding.is_none() && page.note.is_none() {
-        page.note = Some("This pixel encoding requires a texture transcoder. Mip metadata and actual source bytes remain available.".into());
     }
     if (texture.faces > 1 || texture.layers > 1) && page.image.is_some() {
         page.note = Some("The first face and first layer of the selected mip are displayed. Other surface data remains available in Bytes.".into());

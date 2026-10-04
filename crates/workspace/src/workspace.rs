@@ -1040,7 +1040,7 @@ type BuildProjectItemForPathFn =
         &ProjectPath,
         &mut Window,
         &mut App,
-    ) -> Option<Task<Result<(Option<ProjectEntryId>, WorkspaceItemBuilder)>>>;
+    ) -> Option<Task<Result<Option<(Option<ProjectEntryId>, WorkspaceItemBuilder)>>>>;
 
 #[derive(Clone, Default)]
 struct ProjectItemRegistry {
@@ -1068,7 +1068,7 @@ impl ProjectItemRegistry {
                 let entry_abs_path = project.read(cx).absolute_path(&project_path, cx);
                 let is_local = project.read(cx).is_local();
                 let project_item =
-                    <T::Item as project::ProjectItem>::try_open(project, &project_path, cx)?;
+                    <T::Item as project::ProjectItem>::try_open_async(project, &project_path, cx);
                 let project = project.clone();
                 Some(window.spawn(cx, async move |cx| {
                     match project_item.await.with_context(|| {
@@ -1077,7 +1077,8 @@ impl ProjectItemRegistry {
                             entry_abs_path.as_deref().unwrap_or(&project_path.path.as_std_path())
                         )
                     }) {
-                        Ok(project_item) => {
+                        Ok(None) => Ok(None),
+                        Ok(Some(project_item)) => {
                             let project_item = project_item;
                             let project_entry_id: Option<ProjectEntryId> =
                                 project_item.read_with(cx, project::ProjectItem::entry_id);
@@ -1094,7 +1095,7 @@ impl ProjectItemRegistry {
                                     })) as Box<dyn ItemHandle>
                                 },
                             ) as Box<_>;
-                            Ok((project_entry_id, build_workspace_item))
+                            Ok(Some((project_entry_id, build_workspace_item)))
                         }
                         Err(e) => {
                             log::warn!("Failed to open a project item: {e:#}");
@@ -1115,7 +1116,7 @@ impl ProjectItemRegistry {
                                             },
                                         )
                                         as Box<_>;
-                                        return Ok((None, build_workspace_item));
+                                        return Ok(Some((None, build_workspace_item)));
                                     }
                                 }
                             }
@@ -1133,15 +1134,20 @@ impl ProjectItemRegistry {
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<(Option<ProjectEntryId>, WorkspaceItemBuilder)>> {
-        let Some(open_project_item) = self
-            .build_project_item_for_path_fns
-            .iter()
-            .rev()
-            .find_map(|open_project_item| open_project_item(project, path, window, cx))
-        else {
-            return Task::ready(Err(anyhow!("cannot open file {:?}", path.path)));
-        };
-        open_project_item
+        let openers = self.build_project_item_for_path_fns.clone();
+        let project = project.clone();
+        let path = path.clone();
+        window.spawn(cx, async move |cx| {
+            for opener in openers.into_iter().rev() {
+                let candidate = cx.update(|window, cx| opener(&project, &path, window, cx))?;
+                if let Some(candidate) = candidate
+                    && let Some(item) = candidate.await?
+                {
+                    return Ok(item);
+                }
+            }
+            Err(anyhow!("cannot open file {:?}", path.path))
+        })
     }
 
     fn build_item<T: project::ProjectItem>(
@@ -18408,6 +18414,11 @@ mod tests {
 
         use super::*;
 
+        #[derive(Default)]
+        struct AsyncOpeningTrace(Vec<&'static str>);
+
+        impl Global for AsyncOpeningTrace {}
+
         // View
         struct TestPngItemView {
             focus_handle: FocusHandle,
@@ -18425,6 +18436,9 @@ mod tests {
                 path: &ProjectPath,
                 cx: &mut App,
             ) -> Option<Task<anyhow::Result<Entity<Self>>>> {
+                if cx.has_global::<AsyncOpeningTrace>() {
+                    cx.update_global(|trace: &mut AsyncOpeningTrace, _| trace.0.push("fallback"));
+                }
                 if path.path.extension().unwrap() == "png" {
                     let project_path = path.clone();
                     Some(cx.spawn(async move |cx| Ok(cx.new(|_| TestPngItem { project_path }))))
@@ -18622,6 +18636,67 @@ mod tests {
                     focus_handle: cx.focus_handle(),
                 }
             }
+        }
+
+        #[gpui::test]
+        async fn test_async_opener_declines_before_starting_the_next_opener(
+            cx: &mut TestAppContext,
+        ) {
+            init_test(cx);
+            cx.update(|cx| {
+                cx.set_global(AsyncOpeningTrace::default());
+                register_project_item::<TestPngItemView>(cx);
+                cx.default_global::<ProjectItemRegistry>()
+                    .build_project_item_for_path_fns
+                    .push(|_, _, window, cx| {
+                        cx.update_global(|trace: &mut AsyncOpeningTrace, _| {
+                            trace.0.push("probe started")
+                        });
+                        Some(window.spawn(cx, async move |cx| {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(10))
+                                .await;
+                            cx.update(|_, cx| {
+                                cx.update_global(|trace: &mut AsyncOpeningTrace, _| {
+                                    trace.0.push("probe declined")
+                                })
+                            })?;
+                            Ok(None)
+                        }))
+                    });
+            });
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree("/root1", json!({"one.png":"binary file"}))
+                .await;
+            let project = Project::test(fs, [Path::new("/root1")], cx).await;
+            let (workspace, cx) =
+                cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+            let worktree_id = project.read_with(cx, |project, cx| {
+                project
+                    .worktrees(cx)
+                    .next()
+                    .expect("test worktree")
+                    .read(cx)
+                    .id()
+            });
+            let task = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.open_path((worktree_id, rel_path("one.png")), None, true, window, cx)
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                cx.read(|cx| cx.global::<AsyncOpeningTrace>().0.clone()),
+                ["probe started"]
+            );
+            cx.executor().advance_clock(Duration::from_millis(10));
+            let item = task.await.expect("fallback item");
+            assert_eq!(
+                item.to_any_view().entity_type(),
+                TypeId::of::<TestPngItemView>()
+            );
+            assert_eq!(
+                cx.read(|cx| cx.global::<AsyncOpeningTrace>().0.clone()),
+                ["probe started", "probe declined", "fallback"]
+            );
         }
 
         #[gpui::test]

@@ -2,8 +2,9 @@
 
 `file_viewer` registers before text-buffer loading and recognizes the 191 extensions
 in `src/formats.rs`, matching the P4J format inventory. Every recognized local file
-has a read-only tab and a paged Bytes view. Parser errors are visible in that tab.
-Normal code files continue to use the editor.
+has a read-only tab and a paged Hex view. Unsupported content and parser failures
+automatically open Hex with the original reason visible. Unknown local binary files
+also open Hex after a bounded file-header check. Text and code continue to use the editor.
 
 | Family | Content available |
 | --- | --- |
@@ -20,7 +21,7 @@ Normal code files continue to use the editor.
 | Unreal | Versioned names, imports, exports, graph/function/property object types and dependencies |
 | MAX | Compound streams with paged actual stream bytes |
 
-Unknown encodings within a recognized family remain open through Bytes. Proprietary
+Unknown encodings within a recognized family automatically open Hex. Proprietary
 WPS variants, unsupported model encodings and unsupported texture compression do
 not claim full application rendering. Large legacy compound files that exceed the
 index budget use byte pages. Word/PowerPoint layouts and embedded pictures are not
@@ -44,7 +45,9 @@ binary random-read caches have separate fixed bounds before allocation.
 SVG parsing limits reference expansion, gradient/CSS copies and render surfaces;
 font text, embedded raster images and external resources are omitted. SVG and
 compressed texture decoders run in isolated workers before GUI/crash initialization.
-Unsupported or over-budget structures retain an explicit Bytes entry.
+Unsupported binary encodings and parser errors automatically open Hex. Hex pages read at
+most 3200 source bytes and show offsets, hexadecimal values and ASCII; navigation
+and refresh preserve Hex mode.
 
 SQLite uses an immutable, read-only connection with a 2 MiB page cache, disabled
 memory mapping, query-only mode, authorizer restrictions and time/instruction

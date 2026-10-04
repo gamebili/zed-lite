@@ -1012,6 +1012,7 @@ fn triangle_page(
         image,
         next_offset: more.then_some(request.offset.saturating_add(triangles.len() as u64)),
         note: Some("Wireframe and coordinates show up to 200 triangles per page. Choose a projection or inspect raw content.".into()),
+        is_hex: false,
     })
 }
 
@@ -1188,7 +1189,7 @@ mod tests {
         let header = "ply\nformat ascii 1.0\nelement vertex 3\nproperty float x\nproperty float y\nproperty float z\nelement face 1\nproperty list uint int vertex_indices\nend_header\n0 0 0\n1 0 0\n0 1 0\n";
         for face in ["4294967295\n", "3 0 1 3\n", "3 0 -1 2\n", "3 0 1\n"] {
             std::fs::write(&path, format!("{header}{face}"))?;
-            assert!(crate::read(&path, &section("Faces", 0)).is_err());
+            assert!(read(&path, &section("Faces", 0)).is_err());
         }
         let mut input = MeshInput::new(File::open(&path)?);
         input.deadline = Instant::now() - Duration::from_secs(1);
@@ -1234,7 +1235,7 @@ mod tests {
         let image = image::load_from_memory(&draw(&[[[1.0; 3]; 3]], (0, 1))?)?.to_rgba8();
         assert_eq!(image.pixels().filter(|pixel| pixel[0] == 111).count(), 1);
         std::fs::write(&path, "OFF\n3 1 0\n0 0 0\n1 0 0\n0 1 0\n3 0 1 3\n")?;
-        assert!(crate::read(&path, &section("Faces", 0)).is_err());
+        assert!(read(&path, &section("Faces", 0)).is_err());
         Ok(())
     }
 

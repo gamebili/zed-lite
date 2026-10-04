@@ -3,7 +3,7 @@ use anyhow::{Context as _, Result, bail, ensure};
 use std::{
     fs::File,
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -78,7 +78,9 @@ pub(crate) fn bytes(path: &Path, request: &PreviewRequest) -> Result<PreviewPage
     let mut data = vec![0; PAGE_ROWS * 16];
     let length = file.read(&mut data)?;
     data.truncate(length);
-    Ok(hex_page(&data, offset, size, "File bytes"))
+    let mut page = hex_page(&data, offset, size, "Hex");
+    page.is_hex = true;
+    Ok(page)
 }
 
 fn hex_page(data: &[u8], offset: u64, size: u64, title: &str) -> PreviewPage {
@@ -170,6 +172,59 @@ fn bounded(value: &str) -> String {
     format!("{}…", &value[..end])
 }
 
+pub(crate) fn compound_streams<F>(compound: &cfb::CompoundFile<F>) -> Result<Vec<(String, u64)>> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut pending = vec![(PathBuf::from("/"), 0usize)];
+    let mut streams = Vec::new();
+    let mut entries = 0usize;
+    let mut path_bytes = 0usize;
+    while let Some((parent, depth)) = pending.pop() {
+        // CFB clones the parent path for its sibling iterator before yielding
+        // any entry. Bound that path before constructing each iterator.
+        ensure!(
+            parent.as_os_str().len() <= 256 && depth <= 8,
+            "Compound directory exceeds the 256-byte path or 8-level nesting budget"
+        );
+        ensure!(
+            Instant::now() < deadline,
+            "Compound directory exceeds its execution budget"
+        );
+        for entry in compound.read_storage(&parent)? {
+            entries += 1;
+            ensure!(
+                entries <= 4096,
+                "Compound directory exceeds the 4096-entry storage and stream budget"
+            );
+            ensure!(
+                Instant::now() < deadline,
+                "Compound directory exceeds its execution budget"
+            );
+            ensure!(
+                depth < 8,
+                "Compound directory exceeds the 8-level nesting budget"
+            );
+            let path = entry.path();
+            ensure!(
+                path.as_os_str().len() <= 256,
+                "Compound directory exceeds the 256-byte path budget"
+            );
+            let name = path.to_string_lossy();
+            path_bytes += name.len();
+            ensure!(
+                path_bytes <= 1024 * 1024,
+                "Compound directory exceeds the 1 MiB cumulative path budget"
+            );
+            if entry.is_stream() {
+                streams.push((name.into_owned(), entry.len()));
+            } else if entry.is_storage() {
+                pending.push((path.to_path_buf(), depth + 1));
+            }
+        }
+    }
+    streams.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Ok(streams)
+}
+
 fn compound(path: &Path, request: &PreviewRequest) -> Result<PreviewPage> {
     // CFB eagerly builds FAT and directory indexes; cap input before opening it.
     if path.metadata()?.len() > 32 * 1024 * 1024 {
@@ -181,15 +236,7 @@ fn compound(path: &Path, request: &PreviewRequest) -> Result<PreviewPage> {
     // aggregate reads and the declared table sizes also need independent caps.
     let reader = compound_reader(File::open(path)?)?;
     let mut compound = cfb::CompoundFile::open(BufReader::with_capacity(32 * 1024, reader))?;
-    let streams: Vec<_> = compound
-        .walk()
-        .filter(|entry| entry.is_stream())
-        .take(4097)
-        .map(|entry| (entry.path().to_string_lossy().into_owned(), entry.len()))
-        .collect();
-    if streams.len() > 4096 {
-        bail!("Compound file has too many streams to index within the preview budget");
-    }
+    let streams = compound_streams(&compound)?;
     let mut page = PreviewPage {
         title: "Compound document".into(),
         sections: std::iter::once("Streams".into())
@@ -650,6 +697,7 @@ mod tests {
         let file = tempfile::NamedTempFile::new()?;
         std::fs::write(file.path(), b"model \xff\xfe")?;
         let page = text(file.path(), &PreviewRequest::default())?;
+        assert!(page.is_hex);
         assert_eq!(page.columns, ["Offset", "Hexadecimal", "ASCII"]);
         assert!(
             page.rows
@@ -661,7 +709,8 @@ mod tests {
         assert!(page.note.context("UTF-8 note")?.contains("not valid UTF-8"));
         std::fs::write(file.path(), b"model\0binary")?;
         let page = text(file.path(), &PreviewRequest::default())?;
-        assert_eq!(page.title, "File bytes");
+        assert_eq!(page.title, "Hex");
+        assert!(page.is_hex);
         assert!(page.note.context("binary note")?.contains("Binary model"));
         Ok(())
     }
@@ -799,7 +848,81 @@ mod tests {
             },
         )?;
         assert_eq!(page.rows.len(), 2);
+        assert!(!page.is_hex);
+        assert!(page.sections.contains(&"/Scene".into()));
         assert_eq!(std::fs::read(&path)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn small_compound_files_cannot_expand_deep_or_long_directory_paths() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        for (name, component, levels, reason) in [
+            ("deep", "Storage".into(), 40, "nesting budget"),
+            ("long", "层".repeat(31), 4, "256-byte path budget"),
+        ] {
+            let path = directory.path().join(format!("{name}.max"));
+            let mut storage = String::new();
+            for _ in 0..levels {
+                storage.push('/');
+                storage.push_str(&component);
+            }
+            {
+                let mut compound = cfb::create(&path)?;
+                compound.create_storage_all(&storage)?;
+                compound
+                    .create_stream(format!("{storage}/Payload"))?
+                    .write_all(b"actual scene records")?;
+            }
+            let before = std::fs::read(&path)?;
+            assert!(before.len() < 256 * 1024);
+            let error = compound(&path, &PreviewRequest::default())
+                .err()
+                .context("Expected bounded compound directory error")?;
+            assert!(error.to_string().contains(reason), "{error:#}");
+            let page = crate::read(
+                &path,
+                &PreviewRequest {
+                    section: Some("Streams".into()),
+                    offset: 200,
+                },
+            )?;
+            assert!(page.is_hex);
+            assert_eq!(
+                page.rows
+                    .first()
+                    .and_then(|row| row.first())
+                    .map(String::as_str),
+                Some("0000000000000000")
+            );
+            assert_eq!(page.next_offset, Some((PAGE_ROWS * 16) as u64));
+            assert!(
+                page.note
+                    .as_deref()
+                    .is_some_and(|note| note.contains(reason))
+            );
+            assert_eq!(std::fs::read(&path)?, before);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn empty_compound_storages_count_towards_the_directory_entry_budget() -> Result<()> {
+        let mut compound = cfb::CompoundFile::create(io::Cursor::new(Vec::new()))?;
+        let mut pending = vec![(0usize, 4097usize)];
+        while let Some((start, end)) = pending.pop() {
+            if start == end {
+                continue;
+            }
+            let middle = start + (end - start) / 2;
+            compound.create_storage(format!("/Storage{middle:04}"))?;
+            pending.push((start, middle));
+            pending.push((middle + 1, end));
+        }
+        let error = compound_streams(&compound)
+            .err()
+            .context("Expected empty storage directory limit")?;
+        assert!(error.to_string().contains("4096-entry"));
         Ok(())
     }
 }
