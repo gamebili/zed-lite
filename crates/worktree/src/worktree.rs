@@ -920,8 +920,26 @@ impl Worktree {
     }
 
     pub fn load_file(&self, path: &RelPath, cx: &Context<Worktree>) -> Task<Result<LoadedFile>> {
+        self.load_file_internal(path, None, cx)
+    }
+
+    pub fn load_file_with_confirmed_file_size(
+        &self,
+        path: &RelPath,
+        confirmed_file_size: u64,
+        cx: &Context<Worktree>,
+    ) -> Task<Result<LoadedFile>> {
+        self.load_file_internal(path, Some(confirmed_file_size), cx)
+    }
+
+    fn load_file_internal(
+        &self,
+        path: &RelPath,
+        confirmed_file_size: Option<u64>,
+        cx: &Context<Worktree>,
+    ) -> Task<Result<LoadedFile>> {
         match self {
-            Worktree::Local(this) => this.load_file(path, cx),
+            Worktree::Local(this) => this.load_file(path, confirmed_file_size, cx),
             Worktree::Remote(_) => {
                 Task::ready(Err(anyhow!("remote worktrees can't yet load files")))
             }
@@ -933,8 +951,26 @@ impl Worktree {
         path: &RelPath,
         cx: &Context<Worktree>,
     ) -> Task<Result<LoadedBinaryFile>> {
+        self.load_binary_file_internal(path, None, cx)
+    }
+
+    pub fn load_binary_file_with_confirmed_file_size(
+        &self,
+        path: &RelPath,
+        confirmed_file_size: u64,
+        cx: &Context<Worktree>,
+    ) -> Task<Result<LoadedBinaryFile>> {
+        self.load_binary_file_internal(path, Some(confirmed_file_size), cx)
+    }
+
+    fn load_binary_file_internal(
+        &self,
+        path: &RelPath,
+        confirmed_file_size: Option<u64>,
+        cx: &Context<Worktree>,
+    ) -> Task<Result<LoadedBinaryFile>> {
         match self {
-            Worktree::Local(this) => this.load_binary_file(path, cx),
+            Worktree::Local(this) => this.load_binary_file(path, confirmed_file_size, cx),
             Worktree::Remote(_) => {
                 Task::ready(Err(anyhow!("remote worktrees can't yet load binary files")))
             }
@@ -1658,6 +1694,7 @@ impl LocalWorktree {
     fn load_binary_file(
         &self,
         path: &RelPath,
+        confirmed_file_size: Option<u64>,
         cx: &Context<Worktree>,
     ) -> Task<Result<LoadedBinaryFile>> {
         let path = Arc::from(path);
@@ -1668,7 +1705,9 @@ impl LocalWorktree {
 
         let worktree = cx.weak_entity();
         cx.background_spawn(async move {
-            let content = fs.load_bytes(&abs_path).await?;
+            let content =
+                read_file_bytes_with_size_limit(fs.as_ref(), &abs_path, confirmed_file_size)
+                    .await?;
 
             let worktree = worktree.upgrade().context("worktree was dropped")?;
             let file = match entry.await? {
@@ -1702,7 +1741,12 @@ impl LocalWorktree {
     }
 
     #[ztracing::instrument(skip_all)]
-    fn load_file(&self, path: &RelPath, cx: &Context<Worktree>) -> Task<Result<LoadedFile>> {
+    fn load_file(
+        &self,
+        path: &RelPath,
+        confirmed_file_size: Option<u64>,
+        cx: &Context<Worktree>,
+    ) -> Task<Result<LoadedFile>> {
         let path = Arc::from(path);
         let abs_path = self.absolutize(&path);
         let fs = self.fs.clone();
@@ -1711,21 +1755,16 @@ impl LocalWorktree {
 
         let this = cx.weak_entity();
         cx.background_spawn(async move {
-            // WARN: Temporary workaround for #27283.
-            //       We are not efficient with our memory usage per file, and use in excess of 64GB for a 10GB file
-            //       Therefore, as a temporary workaround to prevent system freezes, we just bail before opening a file
-            //       if it is too large
-            //       5GB seems to be more reasonable, peaking at ~16GB, while 6GB jumps up to >24GB which seems like a
-            //       reasonable limit
-            const FILE_SIZE_MAX: u64 = 6 * 1024 * 1024 * 1024; // 6GB
             let metadata = fs.metadata(&abs_path).await?;
-            if let Some(metadata) = metadata.as_ref()
-                && metadata.len >= FILE_SIZE_MAX
-            {
-                anyhow::bail!("File is too large to load");
+            if let Some(metadata) = metadata.as_ref() {
+                file_size_limit(metadata.len, confirmed_file_size)?;
             }
-            let (text, line_ending, encoding, has_bom) =
-                decode_file_text_to_rope(fs.as_ref(), &abs_path).await?;
+            let (text, line_ending, encoding, has_bom) = decode_file_text_to_rope_with_size_limit(
+                fs.as_ref(),
+                &abs_path,
+                confirmed_file_size,
+            )
+            .await?;
             let is_writable = metadata.is_some_and(|metadata| metadata.is_writable);
 
             let worktree = this.upgrade().context("worktree was dropped")?;
@@ -3869,14 +3908,19 @@ impl language::LocalFile for File {
         let worktree = self.worktree.read(cx).as_local().unwrap();
         let abs_path = worktree.absolutize(&self.path);
         let fs = worktree.fs.clone();
-        cx.background_spawn(async move { fs.load(&abs_path).await })
+        cx.background_spawn(async move {
+            let bytes = read_file_bytes_with_size_limit(fs.as_ref(), &abs_path, None).await?;
+            Ok(String::from_utf8(bytes)?)
+        })
     }
 
     fn load_bytes(&self, cx: &App) -> Task<Result<Vec<u8>>> {
         let worktree = self.worktree.read(cx).as_local().unwrap();
         let abs_path = worktree.absolutize(&self.path);
         let fs = worktree.fs.clone();
-        cx.background_spawn(async move { fs.load_bytes(&abs_path).await })
+        cx.background_spawn(async move {
+            read_file_bytes_with_size_limit(fs.as_ref(), &abs_path, None).await
+        })
     }
 }
 
@@ -7238,6 +7282,95 @@ fn read_file_header(file: &mut dyn Read, abs_path: &Path) -> Result<(Vec<u8>, bo
 
 const STREAM_BLOCK_BYTES: usize = 1024 * 1024;
 
+// Text buffer construction still has disproportionate memory use above 6 GiB.
+const MAX_FULL_FILE_SIZE: u64 = 6 * 1024 * 1024 * 1024;
+
+fn file_size_limit(file_size: u64, confirmed_file_size: Option<u64>) -> Result<u64> {
+    anyhow::ensure!(
+        file_size < MAX_FULL_FILE_SIZE,
+        "File is too large to load (6 GiB hard limit)"
+    );
+    let limit = confirmed_file_size
+        .unwrap_or(util::MAX_UNCONFIRMED_FILE_SIZE)
+        .min(MAX_FULL_FILE_SIZE - 1);
+    anyhow::ensure!(
+        file_size <= limit,
+        "File is {file_size} bytes and requires confirmation before loading all contents (current allowance: {limit} bytes)"
+    );
+    Ok(limit)
+}
+
+struct FileSizeLimitedReader {
+    reader: Box<dyn Read + Send + Sync>,
+    remaining: u64,
+    limit_exceeded: bool,
+}
+
+impl Read for FileSizeLimitedReader {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            // Metadata can become stale while a file is being decoded. Probe
+            // for EOF without appending bytes beyond the confirmed allowance.
+            if self.limit_exceeded {
+                return Err(std::io::Error::other(
+                    "File grew beyond its loading allowance; confirmation is required",
+                ));
+            }
+            let mut extra_byte = [0];
+            return match self.reader.read(&mut extra_byte)? {
+                0 => Ok(0),
+                _ => {
+                    self.limit_exceeded = true;
+                    Err(std::io::Error::other(
+                        "File grew beyond its loading allowance; confirmation is required",
+                    ))
+                }
+            };
+        }
+        let length = output
+            .len()
+            .min(self.remaining.min(usize::MAX as u64) as usize);
+        let count = self.reader.read(&mut output[..length])?;
+        self.remaining -= count as u64;
+        Ok(count)
+    }
+}
+
+async fn open_file_with_size_limit(
+    fs: &dyn Fs,
+    abs_path: &Path,
+    confirmed_file_size: Option<u64>,
+) -> Result<FileSizeLimitedReader> {
+    let metadata = fs.metadata(abs_path).await?;
+    let limit = file_size_limit(
+        metadata.as_ref().map_or(0, |metadata| metadata.len),
+        confirmed_file_size,
+    )?;
+    let reader = fs
+        .open_sync(abs_path)
+        .await
+        .with_context(|| format!("opening file {abs_path:?}"))?;
+    Ok(FileSizeLimitedReader {
+        reader,
+        remaining: limit,
+        limit_exceeded: false,
+    })
+}
+
+async fn read_file_bytes_with_size_limit(
+    fs: &dyn Fs,
+    abs_path: &Path,
+    confirmed_file_size: Option<u64>,
+) -> Result<Vec<u8>> {
+    let mut reader = open_file_with_size_limit(fs, abs_path, confirmed_file_size).await?;
+    let mut bytes = Vec::new();
+    read_file_to_end(&mut reader, &mut bytes, abs_path).await?;
+    Ok(bytes)
+}
+
 async fn read_file_to_end(
     file: &mut (dyn Read + Send),
     content: &mut Vec<u8>,
@@ -7274,12 +7407,17 @@ pub async fn decode_file_text(
     fs: &dyn Fs,
     abs_path: &Path,
 ) -> Result<(String, &'static Encoding, bool)> {
-    let mut file = fs
-        .open_sync(&abs_path)
-        .await
-        .with_context(|| format!("opening file {abs_path:?}"))?;
+    decode_file_text_with_size_limit(fs, abs_path, None).await
+}
 
-    let (file_first_bytes, reached_eof) = read_file_header(&mut *file, abs_path)?;
+async fn decode_file_text_with_size_limit(
+    fs: &dyn Fs,
+    abs_path: &Path,
+    confirmed_file_size: Option<u64>,
+) -> Result<(String, &'static Encoding, bool)> {
+    let mut file = open_file_with_size_limit(fs, abs_path, confirmed_file_size).await?;
+
+    let (file_first_bytes, reached_eof) = read_file_header(&mut file, abs_path)?;
     let (_, byte_content) = decode_byte_header(&file_first_bytes);
     anyhow::ensure!(
         byte_content != ByteContent::Binary,
@@ -7289,7 +7427,7 @@ pub async fn decode_file_text(
     // If the file is eligible for opening, read the rest of the file.
     let mut content = file_first_bytes;
     if !reached_eof {
-        read_file_to_end(&mut *file, &mut content, abs_path).await?;
+        read_file_to_end(&mut file, &mut content, abs_path).await?;
     }
     let decoded = decode_text(content)?;
     Ok((decoded.text, decoded.encoding, decoded.has_bom))
@@ -7302,12 +7440,17 @@ pub async fn decode_file_text_to_rope(
     fs: &dyn Fs,
     abs_path: &Path,
 ) -> Result<(Rope, LineEnding, &'static Encoding, bool)> {
-    let mut file = fs
-        .open_sync(abs_path)
-        .await
-        .with_context(|| format!("opening file {abs_path:?}"))?;
+    decode_file_text_to_rope_with_size_limit(fs, abs_path, None).await
+}
 
-    let (prefix, reached_eof) = read_file_header(&mut *file, abs_path)?;
+async fn decode_file_text_to_rope_with_size_limit(
+    fs: &dyn Fs,
+    abs_path: &Path,
+    confirmed_file_size: Option<u64>,
+) -> Result<(Rope, LineEnding, &'static Encoding, bool)> {
+    let mut file = open_file_with_size_limit(fs, abs_path, confirmed_file_size).await?;
+
+    let (prefix, reached_eof) = read_file_header(&mut file, abs_path)?;
     let (bom_encoding, byte_content) = decode_byte_header(&prefix);
     anyhow::ensure!(
         byte_content != ByteContent::Binary,
@@ -7319,13 +7462,14 @@ pub async fn decode_file_text_to_rope(
     if bom_encoding.is_none()
         && byte_content == ByteContent::Unknown
         && let Some((rope, line_ending)) =
-            stream_utf8_into_rope(&mut *file, prefix, reached_eof, abs_path).await?
+            stream_utf8_into_rope(&mut file, prefix, reached_eof, abs_path).await?
     {
         return Ok((rope, line_ending, encoding_rs::UTF_8, false));
     }
 
     // Not plain UTF-8 after all. Re-read the file and decode it all at once.
-    let (mut text, encoding, has_bom) = decode_file_text(fs, abs_path).await?;
+    let (mut text, encoding, has_bom) =
+        decode_file_text_with_size_limit(fs, abs_path, confirmed_file_size).await?;
     let line_ending = LineEnding::detect(&text);
     LineEnding::normalize(&mut text);
     Ok((Rope::from(text), line_ending, encoding, has_bom))
@@ -7456,6 +7600,52 @@ pub fn decode_byte_header(prefix: &[u8]) -> (Option<&'static Encoding>, ByteCont
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_size_guard_rejects_growth_without_appending_or_reading_the_rest() -> Result<()> {
+        struct CountingReader {
+            source: std::io::Cursor<Vec<u8>>,
+            bytes_read: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl Read for CountingReader {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.source.read(output)?;
+                self.bytes_read
+                    .fetch_add(count, std::sync::atomic::Ordering::SeqCst);
+                Ok(count)
+            }
+        }
+
+        let bytes_read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut reader = FileSizeLimitedReader {
+            reader: Box::new(CountingReader {
+                source: std::io::Cursor::new(b"allowed unexpected trailing data".to_vec()),
+                bytes_read: bytes_read.clone(),
+            }),
+            remaining: 7,
+            limit_exceeded: false,
+        };
+        let mut output = Vec::new();
+        let error = reader
+            .read_to_end(&mut output)
+            .expect_err("file grew beyond its metadata allowance");
+        assert!(error.to_string().contains("confirmation"));
+        assert_eq!(output, b"allowed");
+        assert_eq!(bytes_read.load(std::sync::atomic::Ordering::SeqCst), 8);
+        assert!(reader.read(&mut [0; 32]).is_err());
+        assert_eq!(bytes_read.load(std::sync::atomic::Ordering::SeqCst), 8);
+
+        let mut exact = FileSizeLimitedReader {
+            reader: Box::new(std::io::Cursor::new(b"allowed".to_vec())),
+            remaining: 7,
+            limit_exceeded: false,
+        };
+        let mut output = Vec::new();
+        exact.read_to_end(&mut output)?;
+        assert_eq!(output, b"allowed");
+        Ok(())
+    }
 
     /// Streams `bytes` the way `decode_file_text_to_rope` would, returning the
     /// decoded text and detected line ending, or `None` if the fast path bailed.

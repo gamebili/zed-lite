@@ -41,13 +41,61 @@ pub struct PreviewPage {
     pub next_offset: Option<u64>,
     pub note: Option<String>,
     pub is_hex: bool,
+    pub large_file_size: Option<u64>,
 }
 
 pub fn read(path: &Path, request: &PreviewRequest) -> Result<PreviewPage> {
-    anyhow::ensure!(
-        path.metadata()?.is_file(),
-        "Preview requires a regular file"
-    );
+    read_with_size_confirmation(path, request, None)
+}
+
+pub fn read_with_confirmed_file_size(
+    path: &Path,
+    request: &PreviewRequest,
+    confirmed_file_size: u64,
+) -> Result<PreviewPage> {
+    read_with_size_confirmation(path, request, Some(confirmed_file_size))
+}
+
+fn size_requires_confirmation(size: u64, confirmed_file_size: Option<u64>) -> bool {
+    size > util::MAX_UNCONFIRMED_FILE_SIZE
+        && confirmed_file_size.is_none_or(|confirmed| size > confirmed)
+}
+
+fn protected_page(path: &Path, size: u64, confirmed_file_size: Option<u64>) -> Result<PreviewPage> {
+    let mut page = inspect::bytes(path, &PreviewRequest::default())
+        .context("Cannot read the protected file's bounded Hex preview")?;
+    page.large_file_size = Some(size);
+    page.note = Some(match confirmed_file_size {
+        Some(confirmed) => format!(
+            "The file has grown to {size} bytes, beyond the confirmed {confirmed} bytes. Confirm again to open it. A limited Hex preview is shown."
+        ),
+        None => format!(
+            "The file contains {size} bytes and exceeds 500 MB. Confirm before opening it. A limited Hex preview is shown."
+        ),
+    });
+    Ok(page)
+}
+
+fn read_with_size_confirmation(
+    path: &Path,
+    request: &PreviewRequest,
+    confirmed_file_size: Option<u64>,
+) -> Result<PreviewPage> {
+    let metadata = path.metadata()?;
+    anyhow::ensure!(metadata.is_file(), "Preview requires a regular file");
+    if size_requires_confirmation(metadata.len(), confirmed_file_size) {
+        return protected_page(path, metadata.len(), confirmed_file_size);
+    }
+    let page = read_preview(path, request)?;
+    let metadata = path.metadata()?;
+    anyhow::ensure!(metadata.is_file(), "Preview requires a regular file");
+    if size_requires_confirmation(metadata.len(), confirmed_file_size) {
+        return protected_page(path, metadata.len(), confirmed_file_size);
+    }
+    Ok(page)
+}
+
+fn read_preview(path: &Path, request: &PreviewRequest) -> Result<PreviewPage> {
     let preview = classify(path).map(|kind| match kind {
         FileKind::Sqlite => sqlite::read(path, request),
         FileKind::Sheet | FileKind::Word | FileKind::Presentation | FileKind::Wps => {
@@ -159,6 +207,125 @@ mod tests {
             .flat_map(|cell| cell.split_whitespace())
             .map(|value| u8::from_str_radix(value, 16).map_err(anyhow::Error::from))
             .collect()
+    }
+
+    fn sparse_sqlite(path: &Path, size: u64) -> Result<()> {
+        let connection = rusqlite::Connection::open(path)?;
+        connection.execute_batch(
+            "CREATE TABLE confirmed (value TEXT); INSERT INTO confirmed VALUES ('actual row');",
+        )?;
+        drop(connection);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)?
+            .set_len(size)?;
+        Ok(())
+    }
+
+    #[test]
+    fn decimal_size_threshold_protects_only_files_strictly_above_500_mb() -> Result<()> {
+        assert_eq!(util::MAX_UNCONFIRMED_FILE_SIZE, 500_000_000);
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("boundary.sqlite3");
+        sparse_sqlite(&path, util::MAX_UNCONFIRMED_FILE_SIZE - 1)?;
+        for size in [
+            util::MAX_UNCONFIRMED_FILE_SIZE - 1,
+            util::MAX_UNCONFIRMED_FILE_SIZE,
+            util::MAX_UNCONFIRMED_FILE_SIZE + 1,
+        ] {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)?
+                .set_len(size)?;
+            let page = read(&path, &PreviewRequest::default())?;
+            if size > util::MAX_UNCONFIRMED_FILE_SIZE {
+                assert!(page.is_hex);
+                assert_eq!(page.large_file_size, Some(size));
+                assert_eq!(page.rows.len(), PAGE_ROWS);
+                assert_eq!(hex_bytes(&page)?.len(), PAGE_ROWS * 16);
+                assert!(
+                    page.note
+                        .as_deref()
+                        .is_some_and(|note| note.contains("500 MB"))
+                );
+            } else {
+                assert!(!page.is_hex);
+                assert_eq!(page.large_file_size, None);
+                assert!(page.sections.contains(&"Schema".into()));
+            }
+            assert_eq!(fs::metadata(&path)?.len(), size);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn confirmed_large_sqlite_files_keep_structured_pages_until_the_source_grows() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("confirmed.sqlite3");
+        let size = util::MAX_UNCONFIRMED_FILE_SIZE + 4096;
+        sparse_sqlite(&path, size)?;
+        let before = read_bytes(&path, &PreviewRequest::default())?.rows;
+        let request = PreviewRequest {
+            section: Some("table:confirmed".into()),
+            ..Default::default()
+        };
+        let guarded = read(&path, &request)?;
+        assert_eq!(guarded.large_file_size, Some(size));
+        assert!(guarded.is_hex);
+        let schema = read_with_confirmed_file_size(&path, &PreviewRequest::default(), size)?;
+        assert!(!schema.is_hex);
+        assert_eq!(schema.large_file_size, None);
+        assert!(schema.sections.contains(&"Schema".into()));
+        let contents = read_with_confirmed_file_size(&path, &request, size)?;
+        assert!(!contents.is_hex);
+        assert_eq!(contents.large_file_size, None);
+        assert!(
+            contents
+                .rows
+                .first()
+                .and_then(|row| row.first())
+                .is_some_and(|cell| cell.contains("actual row"))
+        );
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)?
+            .set_len(size + 1)?;
+        let grown = read_with_confirmed_file_size(&path, &request, size)?;
+        assert!(grown.is_hex);
+        assert_eq!(grown.large_file_size, Some(size + 1));
+        assert_eq!(grown.rows, before);
+        assert!(
+            grown
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("grown"))
+        );
+        let confirmed_again = read_with_confirmed_file_size(&path, &request, size + 1)?;
+        assert!(!confirmed_again.is_hex);
+        assert_eq!(confirmed_again.rows, contents.rows);
+        assert_eq!(fs::metadata(&path)?.len(), size + 1);
+        Ok(())
+    }
+
+    #[test]
+    fn confirming_a_large_file_does_not_disable_parser_resource_limits() -> Result<()> {
+        let file = tempfile::NamedTempFile::with_suffix(".gltf")?;
+        fs::write(file.path(), br#"{"asset":{"version":"2.0"}}"#)?;
+        let size = util::MAX_UNCONFIRMED_FILE_SIZE + 1;
+        file.as_file().set_len(size)?;
+        let guarded = read(file.path(), &PreviewRequest::default())?;
+        assert_eq!(guarded.large_file_size, Some(size));
+        let page = read_with_confirmed_file_size(file.path(), &PreviewRequest::default(), size)?;
+        assert!(page.is_hex);
+        assert_eq!(page.large_file_size, None);
+        assert!(
+            page.note
+                .as_deref()
+                .is_some_and(|note| note.contains("2 MiB structure budget"))
+        );
+        assert_eq!(page.rows, guarded.rows);
+        assert_eq!(file.as_file().metadata()?.len(), size);
+        Ok(())
     }
 
     #[test]
@@ -281,17 +448,28 @@ mod tests {
             },
         )?;
         assert!(page.is_hex);
+        assert_eq!(page.large_file_size, Some(size));
         assert_eq!(page.rows.len(), PAGE_ROWS);
         assert_eq!(hex_bytes(&page)?.len(), PAGE_ROWS * 16);
         assert_eq!(page.next_offset, Some((PAGE_ROWS * 16) as u64));
         assert!(
             page.note
                 .as_deref()
-                .is_some_and(|note| note.contains("Invalid SQLite file header"))
+                .is_some_and(|note| note.contains("500 MB"))
         );
         let unknown = directory.path().join("huge.foreign_format");
         fs::rename(&path, &unknown)?;
-        let last = read(
+        let unknown_page = read(
+            &unknown,
+            &PreviewRequest {
+                offset: 200,
+                ..Default::default()
+            },
+        )?;
+        assert!(unknown_page.is_hex);
+        assert_eq!(unknown_page.large_file_size, Some(size));
+        assert_eq!(unknown_page.rows, page.rows);
+        let last = read_bytes(
             &unknown,
             &PreviewRequest {
                 offset: size - 16,
@@ -299,6 +477,7 @@ mod tests {
             },
         )?;
         assert!(last.is_hex);
+        assert_eq!(last.large_file_size, None);
         assert_eq!(last.rows.len(), 1);
         assert_eq!(hex_bytes(&last)?, tail);
         assert_eq!(last.next_offset, None);

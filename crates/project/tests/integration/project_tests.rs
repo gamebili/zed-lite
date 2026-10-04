@@ -19,6 +19,7 @@ mod task_inventory;
 mod trusted_worktrees;
 mod yarn;
 
+use anyhow::Context as _;
 use anyhow::Result;
 use async_trait::async_trait;
 use buffer_diff::{
@@ -97,6 +98,156 @@ use util::{
     uri,
 };
 use worktree::WorktreeModelHandle as _;
+
+#[gpui::test]
+async fn oversized_file_loading_requires_size_confirmation(cx: &mut TestAppContext) {
+    let result: Result<()> = async {
+        init_test(cx);
+        let root = Path::new(path!("/large-file-tests"));
+        let filesystem = FakeFs::new(cx.executor());
+        filesystem
+            .insert_tree(
+                root,
+                json!({
+                    "huge.rs": "fn main() {}",
+                    "huge.bin": "binary content",
+                    "ceiling.txt": "",
+                    "small.txt": "small text",
+                    "utf16.txt": ""
+                }),
+            )
+            .await;
+        let oversized = util::MAX_UNCONFIRMED_FILE_SIZE + 1;
+        for (name, size) in [
+            ("huge.rs", oversized),
+            ("huge.bin", oversized),
+            ("ceiling.txt", 6 * 1024 * 1024 * 1024),
+        ] {
+            filesystem.set_file_metadata_len(root.join(name), size)?;
+        }
+        let utf16_bytes = [0xff, 0xfe, b'o', 0, b'k', 0];
+        filesystem
+            .insert_file(root.join("utf16.txt"), utf16_bytes.to_vec())
+            .await;
+        let project = Project::test(filesystem.clone(), [root], cx).await;
+        let worktree = project
+            .read_with(cx, |project, cx| project.worktrees(cx).next())
+            .context("test worktree")?;
+        let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id());
+
+        let error = project
+            .update(cx, |project, cx| {
+                project.open_buffer((worktree_id, rel_path("huge.rs")), cx)
+            })
+            .await
+            .err()
+            .context("expected a confirmation guard before opening huge Rust text")?;
+        assert!(error.to_string().contains("requires confirmation"));
+        let error = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(root.join("huge.rs"), cx)
+            })
+            .await
+            .err()
+            .context("expected standalone opening to retain the same guard")?;
+        assert!(error.to_string().contains("requires confirmation"));
+        let error = worktree
+            .update(cx, |worktree, cx| {
+                worktree.load_binary_file(rel_path("huge.bin"), cx)
+            })
+            .await
+            .err()
+            .context("expected binary full loading to require confirmation")?;
+        assert!(error.to_string().contains("requires confirmation"));
+
+        filesystem.set_file_metadata_len(root.join("huge.rs"), oversized + 1)?;
+        let error = project
+            .update(cx, |project, cx| {
+                project.open_buffer_with_confirmed_file_size(
+                    (worktree_id, rel_path("huge.rs")),
+                    oversized,
+                    cx,
+                )
+            })
+            .await
+            .err()
+            .context("expected growth since confirmation to require another confirmation")?;
+        assert!(error.to_string().contains("requires confirmation"));
+        let confirmed = project
+            .update(cx, |project, cx| {
+                project.open_buffer_with_confirmed_file_size(
+                    (worktree_id, rel_path("huge.rs")),
+                    oversized + 1,
+                    cx,
+                )
+            })
+            .await?;
+        assert_eq!(
+            confirmed.read_with(cx, |buffer, _| buffer.text()),
+            "fn main() {}"
+        );
+        let confirmed_binary = worktree
+            .update(cx, |worktree, cx| {
+                worktree.load_binary_file_with_confirmed_file_size(
+                    rel_path("huge.bin"),
+                    oversized,
+                    cx,
+                )
+            })
+            .await?;
+        assert_eq!(confirmed_binary.content, b"binary content");
+        let error = worktree
+            .update(cx, |worktree, cx| {
+                worktree.load_file_with_confirmed_file_size(rel_path("ceiling.txt"), u64::MAX, cx)
+            })
+            .await
+            .err()
+            .context("expected the original 6 GiB ceiling even after confirmation")?;
+        assert!(error.to_string().contains("6 GiB hard limit"));
+
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_buffer_with_confirmed_file_size(
+                    (worktree_id, rel_path("utf16.txt")),
+                    utf16_bytes.len() as u64,
+                    cx,
+                )
+            })
+            .await?;
+        assert_eq!(buffer.read_with(cx, |buffer, _| buffer.text()), "ok");
+        let binary = worktree
+            .update(cx, |worktree, cx| {
+                worktree.load_binary_file_with_confirmed_file_size(
+                    rel_path("utf16.txt"),
+                    utf16_bytes.len() as u64,
+                    cx,
+                )
+            })
+            .await?;
+        assert_eq!(binary.content, utf16_bytes);
+
+        let small = project
+            .update(cx, |project, cx| {
+                project.open_buffer((worktree_id, rel_path("small.txt")), cx)
+            })
+            .await?;
+        filesystem.set_file_metadata_len(root.join("small.txt"), oversized)?;
+        let reload = small
+            .update(cx, |buffer, cx| {
+                Some(buffer.file()?.as_local()?.load_bytes(cx))
+            })
+            .context("local file reload reader")?;
+        let error = reload
+            .await
+            .err()
+            .context("expected reload growth protection")?;
+        assert!(error.to_string().contains("requires confirmation"));
+        assert_eq!(small.read_with(cx, |buffer, _| buffer.text()), "small text");
+        Ok(())
+    }
+    .await;
+    result.expect("large-file loading safeguards");
+}
 
 #[gpui::test]
 async fn test_block_via_channel(cx: &mut gpui::TestAppContext) {

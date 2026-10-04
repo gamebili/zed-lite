@@ -682,9 +682,15 @@ impl LocalBufferStore {
         &self,
         path: Arc<RelPath>,
         worktree: Entity<Worktree>,
+        confirmed_file_size: Option<u64>,
         cx: &mut Context<BufferStore>,
     ) -> Task<Result<Entity<Buffer>>> {
-        let load_file = worktree.update(cx, |worktree, cx| worktree.load_file(path.as_ref(), cx));
+        let load_file = worktree.update(cx, |worktree, cx| match confirmed_file_size {
+            Some(confirmed_file_size) => {
+                worktree.load_file_with_confirmed_file_size(path.as_ref(), confirmed_file_size, cx)
+            }
+            None => worktree.load_file(path.as_ref(), cx),
+        });
         cx.spawn(async move |this, cx| {
             let path = path.clone();
             let buffer = match load_file.await {
@@ -910,6 +916,29 @@ impl BufferStore {
         project_path: ProjectPath,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Buffer>>> {
+        self.open_buffer_internal(project_path, None, cx)
+    }
+
+    pub fn open_buffer_with_confirmed_file_size(
+        &mut self,
+        project_path: ProjectPath,
+        confirmed_file_size: u64,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Buffer>>> {
+        if matches!(self.state, BufferStoreState::Remote(_)) {
+            return Task::ready(Err(anyhow!(
+                "Loading a confirmed large remote file is not supported"
+            )));
+        }
+        self.open_buffer_internal(project_path, Some(confirmed_file_size), cx)
+    }
+
+    fn open_buffer_internal(
+        &mut self,
+        project_path: ProjectPath,
+        confirmed_file_size: Option<u64>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Buffer>>> {
         if let Some(buffer) = self.get_by_path(&project_path) {
             return Task::ready(Ok(buffer));
         }
@@ -926,7 +955,9 @@ impl BufferStore {
                     return Task::ready(Err(anyhow!("no such worktree")));
                 };
                 let load_buffer = match &self.state {
-                    BufferStoreState::Local(this) => this.open_buffer(path, worktree, cx),
+                    BufferStoreState::Local(this) => {
+                        this.open_buffer(path, worktree, confirmed_file_size, cx)
+                    }
                     BufferStoreState::Remote(this) => this.open_buffer(path, worktree, cx),
                 };
 
@@ -953,7 +984,7 @@ impl BufferStore {
                 if e.error_code() != ErrorCode::Internal {
                     anyhow!(e.error_code())
                 } else {
-                    anyhow!("{e}")
+                    anyhow!("{e:#}")
                 }
             })
         })

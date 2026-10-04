@@ -326,12 +326,13 @@ fn huge_legacy_source_opens_with_bounded_pages() -> Result<()> {
     file.write_all(OLE_SIGNATURE)?;
     let size = 128 * 1024 * 1024 * 1024u64;
     file.set_len(size)?;
-    let page = crate::read(
+    let page = crate::read_with_confirmed_file_size(
         &path,
         &PreviewRequest {
             section: Some("Sheet: Missing".into()),
             offset: 200,
         },
+        size,
     )?;
     assert!(page.is_hex);
     assert_eq!(page.title, "Hex");

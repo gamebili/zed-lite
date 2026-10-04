@@ -45,6 +45,8 @@ pub use path::PathExt;
 pub use path::normalize_path;
 pub use path::rel_path;
 
+pub const MAX_UNCONFIRMED_FILE_SIZE: u64 = 500_000_000;
+
 #[cfg(any(test, feature = "test-support"))]
 pub use util_macros::{line_endings, path, uri};
 

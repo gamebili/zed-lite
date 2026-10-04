@@ -20,12 +20,13 @@ use file_preview::{PreviewPage, PreviewRequest};
 use gpui::{
     AnyElement, App, AppContext, ClipboardItem, Context, ElementId, Entity, EventEmitter,
     FocusHandle, Focusable, Global, Image, ImageFormat, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Render, SharedString, Task, UniformListScrollHandle, WeakEntity,
-    Window, img, px, uniform_list,
+    MouseButton, ParentElement, PromptLevel, Render, SharedString, Task, UniformListScrollHandle,
+    WeakEntity, Window, img, px, uniform_list,
 };
 use language::{ByteContent, Capability, FILE_ANALYSIS_BYTES};
 use project::{Project, ProjectEntryId, ProjectPath};
 use ui::{ListItem, Tooltip, prelude::*};
+use util::ResultExt as _;
 use workspace::{
     ItemId, Pane, Workspace, WorkspaceId, delete_unloaded_items,
     item::{Item, ItemBufferKind, ItemEvent, ProjectItem, SerializableItem},
@@ -56,6 +57,7 @@ pub struct FileItem {
     original_absolute_path: Option<PathBuf>,
     local: bool,
     read_gate: Arc<Mutex<()>>,
+    text_file: bool,
 }
 
 impl FileItem {
@@ -92,6 +94,7 @@ impl FileItem {
             original_absolute_path,
             local,
             read_gate,
+            text_file: false,
         })
     }
 }
@@ -111,14 +114,16 @@ impl project::ProjectItem for FileItem {
         path: &ProjectPath,
         cx: &mut App,
     ) -> Task<Result<Option<Entity<Self>>>> {
-        if let Some(task) = Self::try_open(project, path, cx) {
-            return cx.spawn(async move |_| task.await.map(Some));
-        }
         let project_state = project.read(cx);
-        if !project_state.is_local()
-            || project_state
-                .entry_for_path(path, cx)
-                .is_some_and(|entry| !entry.is_file())
+        if !project_state.is_local() {
+            return match Self::try_open(project, path, cx) {
+                Some(task) => cx.spawn(async move |_| task.await.map(Some)),
+                None => Task::ready(Ok(None)),
+            };
+        }
+        if project_state
+            .entry_for_path(path, cx)
+            .is_some_and(|entry| !entry.is_file())
         {
             return Task::ready(Ok(None));
         }
@@ -134,11 +139,15 @@ impl project::ProjectItem for FileItem {
                 .await
                 .with_context(|| format!("Inspecting file {}", absolute_path.display()))?
             else {
-                return Ok(false);
+                return Ok(None);
             };
             if metadata.is_dir || metadata.is_fifo {
-                return Ok(false);
+                return Ok(None);
             }
+            if file_preview::classify(&absolute_path).is_some() {
+                return Ok(Some(false));
+            }
+            let large_file = metadata.len > util::MAX_UNCONFIRMED_FILE_SIZE;
             let reader = match filesystem.open_sync(&absolute_path).await {
                 Ok(reader) => reader,
                 Err(error)
@@ -148,7 +157,7 @@ impl project::ProjectItem for FileItem {
                             .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
                     }) =>
                 {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 Err(error) => {
                     return Err(error)
@@ -160,11 +169,16 @@ impl project::ProjectItem for FileItem {
                 .take(FILE_ANALYSIS_BYTES as u64)
                 .read_to_end(&mut prefix)
                 .with_context(|| format!("Reading file prefix {}", absolute_path.display()))?;
-            Ok(worktree::decode_byte_header(&prefix).1 == ByteContent::Binary)
+            let binary = worktree::decode_byte_header(&prefix).1 == ByteContent::Binary;
+            Ok((large_file || binary).then_some(!binary))
         });
         cx.spawn(async move |cx| {
-            if probe.await? {
-                Ok(Some(cx.update(|cx| Self::new(&project, &path, cx))))
+            if let Some(text_file) = probe.await? {
+                Ok(Some(cx.update(|cx| {
+                    let item = Self::new(&project, &path, cx);
+                    item.update(cx, |item, _| item.text_file = text_file);
+                    item
+                })))
             } else {
                 Ok(None)
             }
@@ -270,6 +284,11 @@ pub struct FileView {
     playback_message: Option<SharedString>,
     automatic_frames: bool,
     frame_task: Option<Task<()>>,
+    large_file_size: Option<u64>,
+    confirmed_file_size: Option<u64>,
+    workspace: Option<WeakEntity<Workspace>>,
+    full_open_task: Option<Task<()>>,
+    opening_full: bool,
 }
 
 impl FileView {
@@ -298,6 +317,11 @@ impl FileView {
             playback_message: None,
             automatic_frames: false,
             frame_task: None,
+            large_file_size: None,
+            confirmed_file_size: None,
+            workspace: None,
+            full_open_task: None,
+            opening_full: false,
         }
     }
 
@@ -427,6 +451,7 @@ impl FileView {
         let read_gate = item.read_gate.clone();
         let request = self.navigation.request();
         let bytes = self.navigation.bytes;
+        let confirmed_file_size = self.confirmed_file_size;
         let generation = self.generation;
         let cancellation = Arc::new(AtomicBool::new(false));
         self.cancellation = Some(cancellation.clone());
@@ -439,11 +464,32 @@ impl FileView {
             if cancellation.load(Ordering::Acquire) {
                 return None;
             }
-            let result = if bytes {
-                file_preview::read_bytes(&path, &request)
-            } else {
-                file_preview::read(&path, &request)
-            };
+            let result = (|| {
+                let file_size = path.metadata()?.len();
+                let protected = file_size > util::MAX_UNCONFIRMED_FILE_SIZE
+                    && confirmed_file_size.is_none_or(|confirmed| file_size > confirmed);
+                if protected {
+                    let protected_request = if bytes {
+                        request.clone()
+                    } else {
+                        PreviewRequest::default()
+                    };
+                    let mut page = file_preview::read_bytes(&path, &protected_request)?;
+                    page.large_file_size = Some(file_size);
+                    return Ok(page);
+                }
+                if bytes {
+                    file_preview::read_bytes(&path, &request)
+                } else if let Some(confirmed_file_size) = confirmed_file_size {
+                    file_preview::read_with_confirmed_file_size(
+                        &path,
+                        &request,
+                        confirmed_file_size,
+                    )
+                } else {
+                    file_preview::read(&path, &request)
+                }
+            })();
             (!cancellation.load(Ordering::Acquire)).then_some(result)
         });
         self.read_task = Some(cx.spawn(async move |this, cx| {
@@ -470,6 +516,11 @@ impl FileView {
         self.cancellation = None;
         match result.and_then(validate_image) {
             Ok(mut page) => {
+                self.large_file_size = page.large_file_size;
+                if self.large_file_size.is_some() {
+                    self.confirmed_file_size = None;
+                    self.sections = Arc::new(Vec::new());
+                }
                 if page.is_hex && !self.navigation.bytes {
                     self.stop_media();
                     self.navigation.bytes = true;
@@ -502,6 +553,115 @@ impl FileView {
     fn select_section(&mut self, section: String, window: &mut Window, cx: &mut Context<Self>) {
         self.navigation.select_section(Some(section));
         self.load(window, cx);
+    }
+
+    fn open_full_content(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(file_size) = self.large_file_size.filter(|_| !self.opening_full) else {
+            return;
+        };
+        let detail = format!(
+            "This file is {:.1} MB, above the 500 MB protection threshold. Opening all content can use much more memory than the file size and may make Zed unresponsive. Keep the paged preview unless you need the full content.",
+            file_size as f64 / 1_000_000.0
+        );
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Open all file content?",
+            Some(&detail),
+            &["Keep preview", "Open all content"],
+            cx,
+        );
+        self.opening_full = true;
+        let generation = self.generation;
+        self.full_open_task = Some(cx.spawn_in(window, async move |this, cx| {
+            if answer.await.ok() != Some(1) {
+                this.update(cx, |this, cx| {
+                    this.opening_full = false;
+                    cx.notify();
+                })
+                .log_err();
+                return;
+            }
+            let open_buffer = this.update_in(cx, |this, window, cx| {
+                this.opening_full = false;
+                if this.generation != generation || this.large_file_size != Some(file_size) {
+                    cx.notify();
+                    return None;
+                }
+                if !this.item.read(cx).text_file {
+                    this.confirmed_file_size = Some(file_size);
+                    this.navigation = PageNavigation::default();
+                    this.load(window, cx);
+                    return None;
+                }
+                let item = this.item.read(cx);
+                let Some(project) = item.project.upgrade() else {
+                    this.error = Some("The project is no longer available.".into());
+                    cx.notify();
+                    return None;
+                };
+                if this
+                    .workspace
+                    .as_ref()
+                    .and_then(WeakEntity::upgrade)
+                    .is_none()
+                {
+                    this.error = Some("The workspace is no longer available.".into());
+                    cx.notify();
+                    return None;
+                }
+                let path = item.current_project_path(cx);
+                if project.read(cx).get_open_buffer(&path, cx).is_some_and(|buffer| {
+                    buffer.read(cx).file().is_some_and(|file| {
+                        matches!(file.disk_state(), language::DiskState::Present { size, .. } if size != file_size)
+                    })
+                }) {
+                    this.error = Some("This file already has a text tab with an earlier file size. Save any edits and close that text tab before confirming the updated file.".into());
+                    cx.notify();
+                    return None;
+                }
+                this.loading = true;
+                cx.notify();
+                Some(project.update(cx, |project, cx| {
+                    project.open_buffer_with_confirmed_file_size(path, file_size, cx)
+                }))
+            });
+            let Some(open_buffer) = open_buffer.log_err().flatten() else {
+                return;
+            };
+            let result = open_buffer.await;
+            let destination = this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    cx.notify();
+                    return None;
+                }
+                this.loading = false;
+                let destination = match result.and_then(|buffer| {
+                    this.workspace.as_ref().and_then(WeakEntity::upgrade)
+                        .context("The workspace is no longer available")
+                        .map(|workspace| (workspace, buffer))
+                }) {
+                    Ok(destination) => Some(destination),
+                    Err(error) => {
+                        this.error = Some(format!("{error:#}").into());
+                        None
+                    }
+                };
+                cx.notify();
+                destination
+            });
+            if let Some((workspace, buffer)) = destination.log_err().flatten() {
+                let result = workspace.update_in(cx, |workspace, window, cx| {
+                    workspace.replace_preview_with_loaded_buffer(this.entity_id(), buffer, window, cx)
+                }).and_then(|result| result);
+                if let Err(error) = result {
+                    this.update(cx, |this, cx| {
+                        this.error = Some(format!("{error:#}").into());
+                        cx.notify();
+                    }).log_err();
+                }
+            }
+        }));
+        cx.notify();
     }
 
     fn toggle_bytes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -558,16 +718,7 @@ impl FileView {
     }
 
     fn toggle_playback(&mut self, cx: &mut Context<Self>) {
-        if let Some(playback) = &self.playback {
-            let result = if self.playback_paused {
-                playback.play()
-            } else {
-                playback.pause()
-            };
-            if let Err(error) = result {
-                self.playback_message = Some(format!("{error:#}").into());
-            }
-            cx.notify();
+        if self.loading || self.large_file_size.is_some() {
             return;
         }
         let item = self.item.read(cx);
@@ -581,6 +732,32 @@ impl FileView {
             cx.notify();
             return;
         };
+        let result = path.metadata().map_err(anyhow::Error::from).and_then(|metadata| {
+            anyhow::ensure!(
+                metadata.len() <= util::MAX_UNCONFIRMED_FILE_SIZE
+                    || self.confirmed_file_size.is_some_and(|confirmed| metadata.len() <= confirmed),
+                "The file has grown beyond its loading allowance. Refresh the preview and confirm before playback."
+            );
+            Ok(())
+        });
+        if let Err(error) = result {
+            self.stop_media();
+            self.playback_message = Some(format!("{error:#}").into());
+            cx.notify();
+            return;
+        }
+        if let Some(playback) = &self.playback {
+            let result = if self.playback_paused {
+                playback.play()
+            } else {
+                playback.pause()
+            };
+            if let Err(error) = result {
+                self.playback_message = Some(format!("{error:#}").into());
+            }
+            cx.notify();
+            return;
+        }
         match playback::Playback::start(path, self.navigation.offset) {
             Ok(playback) => {
                 self.playback = Some(playback);
@@ -636,6 +813,9 @@ impl FileView {
     }
 
     fn toggle_automatic_frames(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.loading || self.large_file_size.is_some() {
+            return;
+        }
         if self.automatic_frames {
             self.automatic_frames = false;
             self.frame_task = None;
@@ -1126,6 +1306,15 @@ impl Item for FileView {
             cx.new(|cx| Self::with_navigation(item, navigation, window, cx)),
         ))
     }
+
+    fn added_to_workspace(
+        &mut self,
+        workspace: &mut Workspace,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        self.workspace = Some(workspace.weak_handle());
+    }
 }
 
 impl ProjectItem for FileView {
@@ -1234,6 +1423,37 @@ impl Render for FileView {
                         .on_click(cx.listener(|this, _, _, cx| this.copy_page(cx))),
                     ),
             )
+            .when_some(self.large_file_size, |view, file_size| {
+                view.child(
+                    h_flex()
+                        .debug_selector(|| "file-viewer-large-file-protection".into())
+                        .flex_none()
+                        .px_3()
+                        .py_2()
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(cx.theme().colors().border)
+                        .child(
+                            div().flex_1().child(
+                                Label::new(format!(
+                                    "Large file protection: {:.1} MB exceeds 500 MB. Only this Hex page is loaded (up to 3200 bytes).",
+                                    file_size as f64 / 1_000_000.0
+                                )).size(LabelSize::Small),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "file-viewer-open-full-content".into())
+                                .child(
+                                    Button::new("file-viewer-open-full", "Open all content")
+                                        .disabled(self.loading || self.opening_full)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.open_full_content(window, cx)
+                                        })),
+                                ),
+                        ),
+                )
+            })
             .when(media_controls, |view| {
                 view.child(
                     h_flex()
@@ -1258,7 +1478,7 @@ impl Render for FileView {
                                     "Pause"
                                 },
                             )
-                            .disabled(self.playback_starting || !self.item.read(cx).local)
+                            .disabled(self.loading || self.playback_starting || !self.item.read(cx).local)
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_playback(cx))),
                         )
                         .child(
@@ -1475,7 +1695,7 @@ impl SerializableItem for FileView {
 }
 
 pub fn init(cx: &mut App) {
-    workspace::register_project_item::<FileView>(cx);
+    workspace::register_project_item_with_priority::<FileView>(1, cx);
     workspace::register_serializable_item::<FileView>(cx);
 }
 
@@ -1540,6 +1760,260 @@ mod tests {
             cx.set_global(store);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
         });
+    }
+
+    struct TestBufferView {
+        buffer: Entity<language::Buffer>,
+        focus_handle: FocusHandle,
+    }
+
+    impl Focusable for TestBufferView {
+        fn focus_handle(&self, _: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+    impl EventEmitter<()> for TestBufferView {}
+    impl Render for TestBufferView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().child("Loaded text buffer")
+        }
+    }
+    impl Item for TestBufferView {
+        type Event = ();
+        fn tab_content_text(&self, _: usize, _: &App) -> SharedString {
+            "Loaded text".into()
+        }
+        fn for_each_project_item(
+            &self,
+            cx: &App,
+            callback: &mut dyn FnMut(gpui::EntityId, &dyn project::ProjectItem),
+        ) {
+            callback(self.buffer.entity_id(), self.buffer.read(cx));
+        }
+        fn buffer_kind(&self, _: &App) -> ItemBufferKind {
+            ItemBufferKind::Singleton
+        }
+    }
+    impl ProjectItem for TestBufferView {
+        type Item = language::Buffer;
+        fn for_project_item(
+            _: Entity<Project>,
+            _: Option<&Pane>,
+            buffer: Entity<language::Buffer>,
+            _: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> Self {
+            Self {
+                buffer,
+                focus_handle: cx.focus_handle(),
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn only_explicit_confirmation_opens_the_text_buffer(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            cx.set_global(db::AppDatabase::test_new());
+            workspace::register_project_item::<TestBufferView>(cx);
+        });
+        let filesystem = FakeFs::new(cx.executor());
+        filesystem
+            .insert_tree(
+                "/project",
+                serde_json::json!({"large.txt":"all text content"}),
+            )
+            .await;
+        let project = Project::test(filesystem, [Path::new("/project")], cx).await;
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("test worktree")
+                .read(cx)
+                .id()
+        });
+        let path = ProjectPath {
+            worktree_id,
+            path: rel_path("large.txt").into(),
+        };
+        let item = cx.update(|cx| FileItem::new(&project, &path, cx));
+        item.update(cx, |item, _| item.text_file = true);
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let view = cx.update(|window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = FileView::unloaded(item, cx);
+                // The small fake file lets the confirmed loading path run without
+                // allocating a real 500 MB text buffer in the UI test.
+                view.apply_result(
+                    0,
+                    Ok(PreviewPage {
+                        is_hex: true,
+                        large_file_size: Some(util::MAX_UNCONFIRMED_FILE_SIZE + 1),
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+                view
+            });
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            });
+            view
+        });
+        cx.update(|window, cx| view.update(cx, |view, cx| view.open_full_content(window, cx)));
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        assert!(!project.read_with(cx, |project, cx| project.has_open_buffer(path.clone(), cx)));
+        cx.simulate_prompt_answer("Keep preview");
+        cx.run_until_parked();
+        assert!(!project.read_with(cx, |project, cx| project.has_open_buffer(path.clone(), cx)));
+        cx.update(|window, cx| view.update(cx, |view, cx| view.open_full_content(window, cx)));
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Open all content");
+        cx.run_until_parked();
+        assert!(project.read_with(cx, |project, cx| project.has_open_buffer(path.clone(), cx)));
+        assert!(workspace.read_with(cx, |workspace, cx| {
+            workspace.active_item_as::<TestBufferView>(cx).is_some()
+        }));
+        assert!(view.read_with(cx, |view, _| view.error.is_none()));
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .items_of_type::<TestBufferView>(cx)
+                .count()),
+            1
+        );
+    }
+
+    #[gpui::test]
+    async fn large_text_files_open_paged_and_cancel_keeps_protection(cx: &mut TestAppContext) {
+        use std::io::Write as _;
+
+        init_test(cx);
+        let directory = tempfile::tempdir().expect("test directory");
+        let absolute_path = directory.path().join("large.txt");
+        let mut file = std::fs::File::create(&absolute_path).expect("sparse fixture");
+        file.write_all(&vec![b'A'; FILE_ANALYSIS_BYTES])
+            .expect("text prefix");
+        file.set_len(util::MAX_UNCONFIRMED_FILE_SIZE + 1)
+            .expect("large file size");
+        let filesystem = FakeFs::new(cx.executor());
+        filesystem
+            .insert_tree(
+                directory.path(),
+                serde_json::json!({"large.txt":"A".repeat(FILE_ANALYSIS_BYTES)}),
+            )
+            .await;
+        filesystem
+            .set_file_metadata_len(&absolute_path, util::MAX_UNCONFIRMED_FILE_SIZE + 1)
+            .expect("large metadata");
+        let project = Project::test(filesystem, [directory.path()], cx).await;
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("test worktree")
+                .read(cx)
+                .id()
+        });
+        let path = ProjectPath {
+            worktree_id,
+            path: rel_path("large.txt").into(),
+        };
+        let item = cx
+            .update(|cx| FileItem::try_open_async(&project, &path, cx))
+            .await
+            .expect("large text probe")
+            .expect("protected viewer");
+        assert!(item.read_with(cx, |item, _| item.text_file));
+        let (view, cx) = cx.add_window_view(|window, cx| FileView::new(item, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.navigation.bytes);
+            assert_eq!(
+                view.large_file_size,
+                Some(util::MAX_UNCONFIRMED_FILE_SIZE + 1)
+            );
+            assert_eq!(
+                view.page.as_ref().expect("first page").rows.len(),
+                file_preview::PAGE_ROWS
+            );
+            assert_eq!(view.capability(cx), Capability::ReadOnly);
+        });
+        assert!(!project.read_with(cx, |project, cx| project.has_open_buffer(path.clone(), cx)));
+        cx.simulate_resize(gpui::size(px(1200.0), px(800.0)));
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        let button = cx
+            .debug_bounds("file-viewer-open-full-content")
+            .expect("full content button");
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        assert!(
+            cx.pending_prompt()
+                .expect("confirmation")
+                .1
+                .contains("500 MB")
+        );
+        assert!(!project.read_with(cx, |project, cx| project.has_open_buffer(path.clone(), cx)));
+        cx.simulate_prompt_answer("Keep preview");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.opening_full);
+            assert!(view.confirmed_file_size.is_none());
+            assert!(view.large_file_size.is_some());
+        });
+        cx.update(|window, cx| view.update(cx, |view, cx| view.next_page(window, cx)));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.navigation.offset, 3200);
+            assert!(view.large_file_size.is_some());
+        });
+        cx.update(|window, cx| view.update(cx, |view, cx| view.toggle_bytes(window, cx)));
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.navigation.bytes
+            && view.large_file_size.is_some()));
+        cx.update(|window, cx| view.update(cx, |view, cx| view.open_full_content(window, cx)));
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.update(|window, cx| view.update(cx, |view, cx| view.refresh(window, cx)));
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Open all content");
+        cx.run_until_parked();
+        assert!(
+            view.read_with(cx, |view, _| view.confirmed_file_size.is_none()
+                && view.large_file_size.is_some())
+        );
+        let split = cx
+            .update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    view.navigation.bytes = false;
+                    view.navigation.section = Some("Schema".into());
+                    view.navigation.offset = 77;
+                    view.clone_on_split(None, window, cx)
+                })
+            })
+            .await
+            .expect("split preview");
+        cx.run_until_parked();
+        split.read_with(cx, |view, _| {
+            assert_eq!(view.navigation.offset, 0);
+            let page = view.page.as_ref().expect("protected split");
+            assert_eq!(page.rows[0][0], "0000000000000000");
+            assert_eq!(page.next_offset, Some(3200));
+            assert!(view.large_file_size.is_some());
+        });
+        assert!(!project.read_with(cx, |project, cx| project.has_open_buffer(path.clone(), cx)));
+        assert_eq!(
+            std::fs::metadata(absolute_path)
+                .expect("unchanged source")
+                .len(),
+            util::MAX_UNCONFIRMED_FILE_SIZE + 1
+        );
     }
 
     #[test]

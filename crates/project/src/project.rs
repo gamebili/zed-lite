@@ -3303,6 +3303,20 @@ impl Project {
         })
     }
 
+    pub fn open_buffer_with_confirmed_file_size(
+        &mut self,
+        path: impl Into<ProjectPath>,
+        confirmed_file_size: u64,
+        cx: &mut App,
+    ) -> Task<Result<Entity<Buffer>>> {
+        if self.is_disconnected(cx) {
+            return Task::ready(Err(anyhow!(ErrorCode::Disconnected)));
+        }
+        self.buffer_store.update(cx, |buffer_store, cx| {
+            buffer_store.open_buffer_with_confirmed_file_size(path.into(), confirmed_file_size, cx)
+        })
+    }
+
     #[cfg(feature = "test-support")]
     pub fn open_buffer_with_lsp(
         &mut self,

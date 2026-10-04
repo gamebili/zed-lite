@@ -1013,6 +1013,7 @@ fn triangle_page(
         next_offset: more.then_some(request.offset.saturating_add(triangles.len() as u64)),
         note: Some("Wireframe and coordinates show up to 200 triangles per page. Choose a projection or inspect raw content.".into()),
         is_hex: false,
+        large_file_size: None,
     })
 }
 

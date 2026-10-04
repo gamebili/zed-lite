@@ -7,8 +7,60 @@ use image::{DynamicImage, RgbaImage};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 const ROW_BYTES: usize = 8 * 1024 * 1024;
+const READ_BYTES: u64 = 64 * 1024 * 1024;
+
+struct BudgetReader {
+    file: File,
+    remaining: u64,
+    deadline: Instant,
+}
+
+impl BudgetReader {
+    fn new(file: File) -> Self {
+        Self {
+            file,
+            remaining: READ_BYTES,
+            deadline: Instant::now() + Duration::from_secs(5),
+        }
+    }
+
+    fn check_time(&self) -> std::io::Result<()> {
+        if Instant::now() >= self.deadline {
+            return Err(std::io::Error::other(
+                "Photoshop input exceeds its preview time budget",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Read for BudgetReader {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        self.check_time()?;
+        if self.remaining == 0 {
+            return Err(std::io::Error::other(
+                "Photoshop input exceeds its cumulative preview read budget",
+            ));
+        }
+        let length = output.len().min(self.remaining as usize);
+        let count = self.file.read(&mut output[..length])?;
+        self.remaining -= count as u64;
+        Ok(count)
+    }
+}
+
+impl Seek for BudgetReader {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.check_time()?;
+        self.file.seek(position)
+    }
+}
 
 fn block_end(start: u64, length: u64, limit: u64) -> Result<u64, String> {
     start
@@ -112,7 +164,7 @@ fn sample(row: &[u8], x: usize, depth: usize) -> u8 {
 pub fn decode(path: &Path, max_px: u32) -> Result<Decoded, String> {
     let file = File::open(path).map_err(io)?;
     let source_size = file.metadata().map_err(io)?.len();
-    let mut r = BufReader::new(file);
+    let mut r = BufReader::new(BudgetReader::new(file));
     let mut sig = [0u8; 4];
     r.read_exact(&mut sig).map_err(io)?;
     if &sig != b"8BPS" {
@@ -210,8 +262,10 @@ fn composite<R: Read + Seek>(
     merged_alpha: bool,
     max_px: u32,
 ) -> Result<(DynamicImage, u16), String> {
-    let compression = u16be(r).map_err(|_| {
-        "The file stores no composite image (saved without Maximize Compatibility?).".to_string()
+    let compression = u16be(r).map_err(|error| {
+        format!(
+            "The file stores no readable composite image (saved without Maximize Compatibility?): {error}"
+        )
     })?;
     let row_bytes = match h.depth {
         1 => h.width.div_ceil(8),
@@ -346,7 +400,7 @@ pub struct Layer {
 pub fn layers(path: &Path) -> Result<Vec<Layer>, String> {
     let file = File::open(path).map_err(io)?;
     let source_size = file.metadata().map_err(io)?.len();
-    let mut r = BufReader::new(file);
+    let mut r = BufReader::new(BudgetReader::new(file));
     let mut sig = [0u8; 4];
     r.read_exact(&mut sig).map_err(io)?;
     if &sig != b"8BPS" {
@@ -358,7 +412,7 @@ pub fn layers(path: &Path) -> Result<Vec<Layer>, String> {
     skip(&mut r, length, source_size)?;
     let length = u64::from(u32be(&mut r).map_err(io)?);
     skip(&mut r, length, source_size)?;
-    let len = |r: &mut BufReader<File>| -> std::io::Result<u64> {
+    let len = |r: &mut BufReader<BudgetReader>| -> std::io::Result<u64> {
         if psb {
             u64be(r)
         } else {
@@ -678,6 +732,61 @@ mod tests {
         assert_eq!(decoded.source, "thumbnail");
         assert_eq!(decoded.image.width(), 1);
         assert_eq!(decoded.image.height(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn psb_sampled_rows_share_an_aggregate_read_and_time_budget() -> Result<()> {
+        let file = tempfile::NamedTempFile::new()?;
+        let mut source = Vec::from(&1u16.to_be_bytes()[..]);
+        for _ in 0..3 {
+            source.extend_from_slice(&8u32.to_be_bytes());
+        }
+        for value in [10, 20, 30] {
+            source.extend_from_slice(&[0, value, 128, 128, 128, 128, 128, 128]);
+        }
+        std::fs::write(file.path(), &source)?;
+        let header = Header {
+            psb: true,
+            channels: 1,
+            height: 3,
+            width: 1,
+            depth: 8,
+            mode: 1,
+        };
+        let (image, _) = composite(
+            &mut BudgetReader::new(File::open(file.path())?),
+            &header,
+            &[],
+            false,
+            1024,
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(image.to_rgba8().get_pixel(0, 2).0, [30, 30, 30, 255]);
+        for (remaining, deadline, reason) in [
+            (
+                30,
+                Instant::now() + Duration::from_secs(5),
+                "cumulative preview read budget",
+            ),
+            (
+                READ_BYTES,
+                Instant::now() - Duration::from_secs(1),
+                "preview time budget",
+            ),
+        ] {
+            let mut reader = BudgetReader {
+                file: File::open(file.path())?,
+                remaining,
+                deadline,
+            };
+            let error = composite(&mut reader, &header, &[], false, 1024)
+                .err()
+                .context("Expected sampled-row input budget error")?;
+            assert!(error.contains(reason), "{error}");
+            assert!(reader.remaining <= remaining);
+        }
+        assert_eq!(std::fs::read(file.path())?, source);
         Ok(())
     }
 }

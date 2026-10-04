@@ -1045,11 +1045,11 @@ type BuildProjectItemForPathFn =
 #[derive(Clone, Default)]
 struct ProjectItemRegistry {
     build_project_item_fns_by_type: TypeIdHashMap<BuildProjectItemFn>,
-    build_project_item_for_path_fns: Vec<BuildProjectItemForPathFn>,
+    build_project_item_for_path_fns: Vec<(i32, BuildProjectItemForPathFn)>,
 }
 
 impl ProjectItemRegistry {
-    fn register<T: ProjectItem>(&mut self) {
+    fn register<T: ProjectItem>(&mut self, priority: i32) {
         self.build_project_item_fns_by_type.insert(
             TypeId::of::<T::Item>(),
             |item, project, pane, window, cx| {
@@ -1059,7 +1059,7 @@ impl ProjectItemRegistry {
             },
         );
         self.build_project_item_for_path_fns
-            .push(|project, project_path, window, cx| {
+            .push((priority, |project, project_path, window, cx| {
                 let project_path = project_path.clone();
                 let is_file = project
                     .read(cx)
@@ -1124,7 +1124,7 @@ impl ProjectItemRegistry {
                         }
                     }
                 }))
-            });
+            }));
     }
 
     fn open_path(
@@ -1134,11 +1134,12 @@ impl ProjectItemRegistry {
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<(Option<ProjectEntryId>, WorkspaceItemBuilder)>> {
-        let openers = self.build_project_item_for_path_fns.clone();
+        let mut openers = self.build_project_item_for_path_fns.clone();
+        openers.sort_by_key(|(priority, _)| *priority);
         let project = project.clone();
         let path = path.clone();
         window.spawn(cx, async move |cx| {
-            for opener in openers.into_iter().rev() {
+            for (_, opener) in openers.into_iter().rev() {
                 let candidate = cx.update(|window, cx| opener(&project, &path, window, cx))?;
                 if let Some(candidate) = candidate
                     && let Some(item) = candidate.await?
@@ -1170,11 +1171,17 @@ type WorkspaceItemBuilder =
 
 impl Global for ProjectItemRegistry {}
 
-/// Registers a [ProjectItem] for the app. When opening a file, all the registered
-/// items will get a chance to open the file, starting from the project item that
-/// was added last.
+/// Registers a [ProjectItem] at the default priority. Items with the same priority
+/// are tried in reverse registration order when opening a file.
 pub fn register_project_item<I: ProjectItem>(cx: &mut App) {
-    cx.default_global::<ProjectItemRegistry>().register::<I>();
+    register_project_item_with_priority::<I>(0, cx);
+}
+
+/// Registers a [ProjectItem] for the app. Higher priorities are tried first;
+/// items with equal priorities are tried in reverse registration order.
+pub fn register_project_item_with_priority<I: ProjectItem>(priority: i32, cx: &mut App) {
+    cx.default_global::<ProjectItemRegistry>()
+        .register::<I>(priority);
 }
 
 #[derive(Default)]
@@ -4956,6 +4963,48 @@ impl Workspace {
             window,
             cx,
         )
+    }
+
+    pub fn replace_preview_with_loaded_buffer(
+        &mut self,
+        preview_item_id: EntityId,
+        buffer: Entity<Buffer>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let pane = self
+            .pane_for_item_id(preview_item_id)
+            .context("The file preview has been closed")?;
+        let existing = pane
+            .read(cx)
+            .items()
+            .find(|item| {
+                item.project_item_model_ids(cx)
+                    .contains(&buffer.entity_id())
+                    && item.buffer_kind(cx) == ItemBufferKind::Singleton
+            })
+            .cloned();
+        if let Some(item) = existing {
+            pane.update(cx, |pane, cx| {
+                pane.remove_item(preview_item_id, false, false, window, cx)
+            });
+            self.activate_item(item.as_ref(), true, true, window, cx);
+            return Ok(());
+        }
+        let item = cx
+            .update_default_global(|registry: &mut ProjectItemRegistry, cx| {
+                registry.build_item(buffer, self.project.clone(), None, window, cx)
+            })
+            .context("No registered view can display the loaded text buffer")?;
+        let destination_index = pane
+            .read(cx)
+            .items()
+            .position(|item| item.item_id() == preview_item_id);
+        pane.update(cx, |pane, cx| {
+            pane.remove_item(preview_item_id, false, false, window, cx)
+        });
+        self.add_item(pane, item, destination_index, true, true, window, cx);
+        Ok(())
     }
 
     pub fn add_item(
@@ -18529,6 +18578,9 @@ mod tests {
                 path: &ProjectPath,
                 cx: &mut App,
             ) -> Option<Task<anyhow::Result<Entity<Self>>>> {
+                if cx.has_global::<AsyncOpeningTrace>() {
+                    cx.update_global(|trace: &mut AsyncOpeningTrace, _| trace.0.push("notebook"));
+                }
                 if path.path.extension().unwrap() == "ipynb" {
                     Some(cx.spawn(async move |cx| Ok(cx.new(|_| TestIpynbItem {}))))
                 } else {
@@ -18648,7 +18700,7 @@ mod tests {
                 register_project_item::<TestPngItemView>(cx);
                 cx.default_global::<ProjectItemRegistry>()
                     .build_project_item_for_path_fns
-                    .push(|_, _, window, cx| {
+                    .push((0, |_, _, window, cx| {
                         cx.update_global(|trace: &mut AsyncOpeningTrace, _| {
                             trace.0.push("probe started")
                         });
@@ -18663,7 +18715,7 @@ mod tests {
                             })?;
                             Ok(None)
                         }))
-                    });
+                    }));
             });
             let fs = FakeFs::new(cx.executor());
             fs.insert_tree("/root1", json!({"one.png":"binary file"}))
@@ -18696,6 +18748,71 @@ mod tests {
             assert_eq!(
                 cx.read(|cx| cx.global::<AsyncOpeningTrace>().0.clone()),
                 ["probe started", "probe declined", "fallback"]
+            );
+        }
+
+        #[gpui::test]
+        async fn test_project_item_priority_preserves_default_fallback_order(
+            cx: &mut TestAppContext,
+        ) {
+            init_test(cx);
+            cx.update(|cx| {
+                cx.set_global(AsyncOpeningTrace::default());
+                register_project_item::<TestIpynbItemView>(cx);
+                register_project_item_with_priority::<TestPngItemView>(1, cx);
+                register_project_item::<TestAlternatePngItemView>(cx);
+            });
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(
+                "/root1",
+                json!({"one.png":"binary file", "two.ipynb":"notebook"}),
+            )
+            .await;
+            let project = Project::test(fs, [Path::new("/root1")], cx).await;
+            let (workspace, cx) =
+                cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+            let worktree_id = project.read_with(cx, |project, cx| {
+                project
+                    .worktrees(cx)
+                    .next()
+                    .expect("test worktree")
+                    .read(cx)
+                    .id()
+            });
+            let item = workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.open_path((worktree_id, rel_path("one.png")), None, true, window, cx)
+                })
+                .await
+                .expect("priority item");
+            assert_eq!(
+                item.to_any_view().entity_type(),
+                TypeId::of::<TestPngItemView>()
+            );
+            assert_eq!(
+                cx.read(|cx| cx.global::<AsyncOpeningTrace>().0.clone()),
+                ["fallback"]
+            );
+            cx.update_global(|trace: &mut AsyncOpeningTrace, _| trace.0.clear());
+            let item = workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.open_path(
+                        (worktree_id, rel_path("two.ipynb")),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    )
+                })
+                .await
+                .expect("default item after priority opener declined");
+            assert_eq!(
+                item.to_any_view().entity_type(),
+                TypeId::of::<TestIpynbItemView>()
+            );
+            assert_eq!(
+                cx.read(|cx| cx.global::<AsyncOpeningTrace>().0.clone()),
+                ["fallback", "fallback", "notebook"]
             );
         }
 

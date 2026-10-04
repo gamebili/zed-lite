@@ -1879,6 +1879,22 @@ impl FakeFs {
         state.next_mtime = next_mtime;
     }
 
+    /// Lets large-file tests change reported size without allocating that content.
+    pub fn set_file_metadata_len(&self, path: impl AsRef<Path>, new_len: u64) -> Result<()> {
+        let path = normalize_path(path.as_ref());
+        let mut state = self.state.lock();
+        let new_mtime = state.get_and_increment_mtime();
+        match state.entry(&path)? {
+            FakeFsEntry::File { len, mtime, .. } => {
+                *len = new_len;
+                *mtime = new_mtime;
+            }
+            _ => anyhow::bail!("not a file: {path:?}"),
+        }
+        state.emit_event([(path, Some(PathEventKind::Changed))]);
+        Ok(())
+    }
+
     pub fn get_and_increment_mtime(&self) -> MTime {
         let mut state = self.state.lock();
         state.get_and_increment_mtime()

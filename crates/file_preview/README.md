@@ -36,6 +36,16 @@ PDF page rendering. Neither tools nor conversion results modify the source.
 
 ## Resource budgets
 
+Files strictly larger than 500 MB (500,000,000 bytes), including text files, open
+in a read-only Hex preview before any complete loading or format parsing. Each
+page reads at most 3200 bytes. “Open all content” displays a confirmation with the
+file size and memory risk; cancelling retains the preview. Confirmed text opens
+in the editor, while confirmed structured formats keep their paging and decoder
+budgets. Confirmation is scoped to the current opening and file size: growth and
+restoring or splitting a preview require confirmation again. Direct buffer loads
+also enforce the threshold. Remote full-content confirmation is unavailable,
+and the existing 6 GiB text loading limit remains in place.
+
 Only one synchronous parser runs across the app at a time. Pages hold at most 200
 rows / 2 MiB of text with 4 KiB cell prefixes, and the view virtualizes rows, section
 lists and metadata. Image output is PNG with each edge at most 1024 pixels. Native
