@@ -169,6 +169,14 @@ pub fn read_bytes(path: &Path, request: &PreviewRequest) -> Result<PreviewPage> 
     inspect::bytes(path, request)
 }
 
+pub fn read_text(path: &Path, request: &PreviewRequest) -> Result<PreviewPage> {
+    anyhow::ensure!(
+        path.metadata()?.is_file(),
+        "Preview requires a regular file"
+    );
+    inspect::read_text(path, request)
+}
+
 #[derive(Default, Debug, serde::Serialize)]
 pub(crate) struct Prop {
     pub label: String,

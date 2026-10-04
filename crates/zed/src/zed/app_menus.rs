@@ -133,6 +133,9 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                 MenuItem::action(ui::tr("Open Recent…"), zed_actions::OpenRecent::default()),
                 MenuItem::action(ui::tr("Open Remote…"), zed_actions::OpenRemote::default()),
                 MenuItem::separator(),
+                MenuItem::action(ui::tr("Open as Plain Text"), file_viewer::OpenAsPlainText),
+                MenuItem::action(ui::tr("Open as Hex"), file_viewer::OpenAsHex),
+                MenuItem::separator(),
                 MenuItem::action(
                     ui::tr("Add Folder to Project…"),
                     workspace::AddFolderToProject,

@@ -21,7 +21,7 @@ use gpui::{
     AnyElement, App, AppContext, ClipboardItem, Context, ElementId, Entity, EventEmitter,
     FocusHandle, Focusable, Global, Image, ImageFormat, InteractiveElement, IntoElement,
     MouseButton, ParentElement, PromptLevel, Render, SharedString, Task, UniformListScrollHandle,
-    WeakEntity, Window, img, px, uniform_list,
+    WeakEntity, Window, actions, img, px, uniform_list,
 };
 use language::{ByteContent, Capability, FILE_ANALYSIS_BYTES};
 use project::{Project, ProjectEntryId, ProjectPath};
@@ -39,6 +39,50 @@ const HEX_COLUMN_WIDTH: f32 = 480.0;
 const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_IMAGE_PIXELS: u64 = 1024 * 1024;
 const MAX_PAGE_HISTORY: usize = 4096;
+
+actions!(
+    file_viewer,
+    [
+        /// Opens the current file as paged, read-only plain text.
+        OpenAsPlainText,
+        /// Opens the current file as paged, read-only hexadecimal bytes.
+        OpenAsHex
+    ]
+);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenMode {
+    Preview,
+    PlainText,
+    Hex,
+}
+
+impl OpenMode {
+    fn navigation(self) -> PageNavigation {
+        PageNavigation {
+            bytes: self == Self::Hex,
+            text: self == Self::PlainText,
+            ..Default::default()
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Preview => "preview",
+            Self::PlainText => "text",
+            Self::Hex => "hex",
+        }
+    }
+
+    fn from_name(name: &str) -> Result<Self> {
+        match name {
+            "preview" => Ok(Self::Preview),
+            "text" => Ok(Self::PlainText),
+            "hex" => Ok(Self::Hex),
+            _ => anyhow::bail!("Unknown file viewing mode: {name}"),
+        }
+    }
+}
 
 #[derive(Default)]
 struct ReadGate(Arc<Mutex<()>>);
@@ -210,6 +254,7 @@ impl project::ProjectItem for FileItem {
 struct PageNavigation {
     section: Option<String>,
     bytes: bool,
+    text: bool,
     offset: u64,
     previous_offsets: Vec<u64>,
     page_number: u64,
@@ -225,6 +270,7 @@ impl PageNavigation {
 
     fn select_section(&mut self, section: Option<String>) {
         self.bytes = false;
+        self.text = false;
         self.section = section;
         self.reset_page();
     }
@@ -237,6 +283,7 @@ impl PageNavigation {
 
     fn toggle_bytes(&mut self) {
         self.bytes = !self.bytes;
+        self.text = false;
         self.reset_page();
     }
 
@@ -264,6 +311,7 @@ pub struct FileView {
     item: Entity<FileItem>,
     focus_handle: FocusHandle,
     navigation: PageNavigation,
+    alternative_mode: Option<OpenMode>,
     page: Option<Arc<PreviewPage>>,
     image: Option<Arc<Image>>,
     sections: Arc<Vec<String>>,
@@ -297,6 +345,7 @@ impl FileView {
             item,
             focus_handle: cx.focus_handle(),
             navigation: PageNavigation::default(),
+            alternative_mode: None,
             page: None,
             image: None,
             sections: Arc::new(Vec::new()),
@@ -327,6 +376,15 @@ impl FileView {
 
     fn new(item: Entity<FileItem>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self::with_navigation(item, PageNavigation::default(), window, cx)
+    }
+
+    fn open_as(&mut self, mode: OpenMode, window: &mut Window, cx: &mut Context<Self>) {
+        self.alternative_mode = Some(mode);
+        self.navigation = mode.navigation();
+        self.confirmed_file_size = None;
+        self.sections = Arc::new(Vec::new());
+        self.load(window, cx);
+        cx.emit(ItemEvent::UpdateTab);
     }
 
     fn with_navigation(
@@ -451,6 +509,7 @@ impl FileView {
         let read_gate = item.read_gate.clone();
         let request = self.navigation.request();
         let bytes = self.navigation.bytes;
+        let text = self.navigation.text;
         let confirmed_file_size = self.confirmed_file_size;
         let generation = self.generation;
         let cancellation = Arc::new(AtomicBool::new(false));
@@ -478,8 +537,10 @@ impl FileView {
                     page.large_file_size = Some(file_size);
                     return Ok(page);
                 }
-                if bytes {
+                let page = if bytes {
                     file_preview::read_bytes(&path, &request)
+                } else if text {
+                    file_preview::read_text(&path, &request)
                 } else if let Some(confirmed_file_size) = confirmed_file_size {
                     file_preview::read_with_confirmed_file_size(
                         &path,
@@ -488,7 +549,21 @@ impl FileView {
                     )
                 } else {
                     file_preview::read(&path, &request)
+                }?;
+                let file_size = path.metadata()?.len();
+                if file_size > util::MAX_UNCONFIRMED_FILE_SIZE
+                    && confirmed_file_size.is_none_or(|confirmed| file_size > confirmed)
+                {
+                    let request = if bytes {
+                        request
+                    } else {
+                        PreviewRequest::default()
+                    };
+                    let mut page = file_preview::read_bytes(&path, &request)?;
+                    page.large_file_size = Some(file_size);
+                    return Ok(page);
                 }
+                Ok(page)
             })();
             (!cancellation.load(Ordering::Acquire)).then_some(result)
         });
@@ -524,9 +599,13 @@ impl FileView {
                 if page.is_hex && !self.navigation.bytes {
                     self.stop_media();
                     self.navigation.bytes = true;
+                    self.navigation.text = false;
                     self.navigation.reset_page();
                 }
-                if !self.navigation.bytes && self.navigation.section.is_none() {
+                if !self.navigation.bytes
+                    && !self.navigation.text
+                    && self.navigation.section.is_none()
+                {
                     self.navigation.section = page.sections.first().cloned();
                 }
                 if !page.sections.is_empty() {
@@ -552,6 +631,10 @@ impl FileView {
 
     fn select_section(&mut self, section: String, window: &mut Window, cx: &mut Context<Self>) {
         self.navigation.select_section(Some(section));
+        if self.alternative_mode.is_some() {
+            self.alternative_mode = Some(OpenMode::Preview);
+            cx.emit(ItemEvent::UpdateTab);
+        }
         self.load(window, cx);
     }
 
@@ -587,9 +670,9 @@ impl FileView {
                     cx.notify();
                     return None;
                 }
-                if !this.item.read(cx).text_file {
+                if this.alternative_mode.is_some() || !this.item.read(cx).text_file {
                     this.confirmed_file_size = Some(file_size);
-                    this.navigation = PageNavigation::default();
+                    this.navigation = this.alternative_mode.map(OpenMode::navigation).unwrap_or_default();
                     this.load(window, cx);
                     return None;
                 }
@@ -666,6 +749,14 @@ impl FileView {
 
     fn toggle_bytes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.navigation.toggle_bytes();
+        if self.alternative_mode.is_some() {
+            self.alternative_mode = Some(if self.navigation.bytes {
+                OpenMode::Hex
+            } else {
+                OpenMode::Preview
+            });
+            cx.emit(ItemEvent::UpdateTab);
+        }
         self.load(window, cx);
     }
 
@@ -691,7 +782,12 @@ impl FileView {
 
     fn copy_page(&mut self, cx: &mut Context<Self>) {
         if let Some(page) = &self.page {
-            cx.write_to_clipboard(ClipboardItem::new_string(page_as_tsv(page)));
+            let text = if self.navigation.text {
+                page.rows.iter().flatten().map(String::as_str).collect()
+            } else {
+                page_as_tsv(page)
+            };
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
             self.copied_page = true;
             cx.notify();
         }
@@ -1037,6 +1133,9 @@ impl FileView {
     }
 
     fn render_table(&self, page: &PreviewPage, cx: &mut Context<Self>) -> AnyElement {
+        if self.navigation.text {
+            return self.render_text(page, cx);
+        }
         let columns = column_count(page);
         let view = cx.entity().downgrade();
         div()
@@ -1089,6 +1188,55 @@ impl FileView {
                         .flex_1()
                         .min_h_0(),
                     ),
+            )
+            .into_any_element()
+    }
+
+    fn render_text(&self, page: &PreviewPage, cx: &mut Context<Self>) -> AnyElement {
+        let rows = Arc::new(plain_text_lines(page));
+        let width = rows
+            .iter()
+            .map(|line| {
+                line.chars()
+                    .map(|character| if character == '\t' { 4 } else { 1 })
+                    .sum::<usize>()
+            })
+            .max()
+            .unwrap_or_default();
+        let font_size = TextSize::Editor.pixels(cx);
+        div()
+            .id("file-viewer-text-scroll")
+            .debug_selector(|| "file-viewer-plain-text".into())
+            .size_full()
+            .overflow_x_scroll()
+            .child(
+                uniform_list("file-viewer-text-lines", rows.len(), move |range, _, cx| {
+                    range
+                        .filter_map(|index| {
+                            let line = rows.get(index)?;
+                            let text: SharedString = line
+                                .trim_end_matches(['\r', '\n'])
+                                .replace('\t', "    ")
+                                .into();
+                            Some(
+                                div()
+                                    .id(ElementId::NamedInteger(
+                                        "file-text-line".into(),
+                                        index as u64,
+                                    ))
+                                    .h(font_size * 1.5)
+                                    .font_buffer(cx)
+                                    .text_size(font_size)
+                                    .whitespace_nowrap()
+                                    .child(text),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .track_scroll(&self.row_scroll)
+                .w(font_size * width as f32 + px(16.0))
+                .min_w_full()
+                .h_full(),
             )
             .into_any_element()
     }
@@ -1215,6 +1363,26 @@ fn page_as_tsv(page: &PreviewPage) -> String {
     text
 }
 
+fn plain_text_lines(page: &PreviewPage) -> Vec<String> {
+    // Storage cells can split CRLF or long lines. Reassemble only this bounded
+    // page before deriving display lines, so a split separator adds no blank row.
+    let text: String = page.rows.iter().flatten().map(String::as_str).collect();
+    let mut lines = Vec::new();
+    for mut line in text.lines() {
+        while line.len() > file_preview::CELL_BYTES {
+            let mut end = file_preview::CELL_BYTES;
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            let (prefix, remainder) = line.split_at(end);
+            lines.push(prefix.to_owned());
+            line = remainder;
+        }
+        lines.push(line.to_owned());
+    }
+    lines
+}
+
 impl Focusable for FileView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -1231,15 +1399,20 @@ impl Item for FileView {
     }
 
     fn tab_content_text(&self, _: usize, cx: &App) -> SharedString {
-        self.item
+        let name = self
+            .item
             .read(cx)
             .current_project_path(cx)
             .path
             .as_std_path()
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "File preview".into())
-            .into()
+            .unwrap_or_else(|| "File preview".into());
+        match self.alternative_mode {
+            Some(OpenMode::PlainText) => format!("{name} · {}", ui::tr("Plain Text")).into(),
+            Some(OpenMode::Hex) => format!("{name} · Hex").into(),
+            _ => name.into(),
+        }
     }
 
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
@@ -1266,7 +1439,17 @@ impl Item for FileView {
     }
 
     fn buffer_kind(&self, _: &App) -> ItemBufferKind {
-        ItemBufferKind::Singleton
+        if self.alternative_mode.is_some() {
+            // An alternate view must coexist with the editor for the same file,
+            // especially when the editor contains unsaved changes.
+            ItemBufferKind::None
+        } else {
+            ItemBufferKind::Singleton
+        }
+    }
+
+    fn active_project_path(&self, cx: &App) -> Option<ProjectPath> {
+        Some(self.item.read(cx).current_project_path(cx))
     }
 
     fn capability(&self, _: &App) -> Capability {
@@ -1302,9 +1485,12 @@ impl Item for FileView {
     ) -> Task<Option<Entity<Self>>> {
         let item = self.item.clone();
         let navigation = self.navigation.clone();
-        Task::ready(Some(
-            cx.new(|cx| Self::with_navigation(item, navigation, window, cx)),
-        ))
+        let alternative_mode = self.alternative_mode;
+        Task::ready(Some(cx.new(|cx| {
+            let mut view = Self::with_navigation(item, navigation, window, cx);
+            view.alternative_mode = alternative_mode;
+            view
+        })))
     }
 
     fn added_to_workspace(
@@ -1338,7 +1524,8 @@ impl Render for FileView {
             !self.loading && page.as_ref().is_some_and(|page| page.next_offset.is_some());
         let selected_cell = self.selected_cell_text().map(str::to_owned);
         let media_kind = self.media_kind(cx);
-        let media_controls = media_kind.is_some() && !self.navigation.bytes;
+        let media_controls =
+            media_kind.is_some() && !self.navigation.bytes && !self.navigation.text;
 
         v_flex()
             .debug_selector(|| "file-viewer-root".into())
@@ -1516,7 +1703,7 @@ impl Render for FileView {
                     .flex_1()
                     .min_h_0()
                     .items_stretch()
-                    .when(!self.sections.is_empty(), |content| {
+                    .when(!self.sections.is_empty() && !self.navigation.bytes && !self.navigation.text, |content| {
                         content.child(self.render_sections(cx))
                     })
                     .child(
@@ -1644,9 +1831,10 @@ impl SerializableItem for FileView {
     ) -> Task<Result<Entity<Self>>> {
         let database = FileViewerDb::global(cx);
         window.spawn(cx, async move |cx| {
-            let path = database
-                .get_file_path(item_id, workspace_id)?
+            let (path, mode) = database
+                .get_file_state(item_id, workspace_id)?
                 .context("No preview file path found")?;
+            let mode = mode.as_deref().map(OpenMode::from_name).transpose()?;
             let (worktree, path) = project
                 .update(cx, |project, cx| {
                     project.find_or_create_worktree(path, false, cx)
@@ -1654,13 +1842,27 @@ impl SerializableItem for FileView {
                 .await?;
             let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id());
             let project_path = ProjectPath { worktree_id, path };
-            let task = cx.update(|_, cx| {
-                <FileItem as project::ProjectItem>::try_open_async(&project, &project_path, cx)
-            })?;
-            let item = task
-                .await?
-                .context("This file does not require a binary preview")?;
-            cx.update(|window, cx| cx.new(|cx| Self::new(item, window, cx)))
+            let item = if mode.is_some() {
+                cx.update(|_, cx| FileItem::new(&project, &project_path, cx))?
+            } else {
+                let task = cx.update(|_, cx| {
+                    <FileItem as project::ProjectItem>::try_open_async(&project, &project_path, cx)
+                })?;
+                task.await?
+                    .context("This file does not require a binary preview")?
+            };
+            cx.update(|window, cx| {
+                cx.new(|cx| {
+                    let mut view = Self::with_navigation(
+                        item,
+                        mode.map(OpenMode::navigation).unwrap_or_default(),
+                        window,
+                        cx,
+                    );
+                    view.alternative_mode = mode;
+                    view
+                })
+            })
         })
     }
 
@@ -1683,20 +1885,89 @@ impl SerializableItem for FileView {
     ) -> Option<Task<Result<()>>> {
         let workspace_id = workspace.database_id()?;
         let path = self.item.read(cx).absolute_path(cx)?;
+        let mode = self.alternative_mode.map(|mode| mode.name().to_owned());
         let database = FileViewerDb::global(cx);
         Some(cx.background_spawn(async move {
-            database.save_file_path(item_id, workspace_id, path).await
+            database
+                .save_file_state(item_id, workspace_id, path, mode)
+                .await
         }))
     }
 
-    fn should_serialize(&self, _: &Self::Event) -> bool {
-        false
+    fn should_serialize(&self, event: &Self::Event) -> bool {
+        matches!(event, ItemEvent::UpdateTab)
     }
 }
 
 pub fn init(cx: &mut App) {
     workspace::register_project_item_with_priority::<FileView>(1, cx);
     workspace::register_serializable_item::<FileView>(cx);
+    cx.observe_new(|workspace: &mut Workspace, _, _| {
+        workspace.register_action_renderer(|div, workspace, _, cx| {
+            let project = workspace.project().read(cx);
+            let path = workspace
+                .active_item(cx)
+                .and_then(|item| item.project_path(cx));
+            let available = project.is_local()
+                && path.as_ref().is_some_and(|path| {
+                    project
+                        .entry_for_path(path, cx)
+                        .is_none_or(|entry| entry.is_file())
+                        && project.absolute_path(path, cx).is_some()
+                });
+            div.when(available, |div| {
+                div.on_action(cx.listener(|workspace, _: &OpenAsPlainText, window, cx| {
+                    open_current_file_as(workspace, OpenMode::PlainText, window, cx);
+                }))
+                .on_action(cx.listener(
+                    |workspace, _: &OpenAsHex, window, cx| {
+                        open_current_file_as(workspace, OpenMode::Hex, window, cx);
+                    },
+                ))
+            })
+        });
+    })
+    .detach();
+}
+
+fn open_current_file_as(
+    workspace: &mut Workspace,
+    mode: OpenMode,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(source) = workspace.active_item(cx) else {
+        return;
+    };
+    let Some(path) = source.project_path(cx) else {
+        return;
+    };
+    if !workspace.project().read(cx).is_local() {
+        return;
+    }
+    let view = source.downcast::<FileView>().or_else(|| {
+        workspace
+            .active_pane()
+            .read(cx)
+            .items_of_type::<FileView>()
+            .find(|view| {
+                let view = view.read(cx);
+                view.alternative_mode.is_some()
+                    && view.active_project_path(cx) == Some(path.clone())
+            })
+    });
+    if let Some(view) = view {
+        view.update(cx, |view, cx| view.open_as(mode, window, cx));
+        workspace.activate_item(&view, true, true, window, cx);
+    } else {
+        let item = FileItem::new(workspace.project(), &path, cx);
+        let view = cx.new(|cx| {
+            let mut view = FileView::with_navigation(item, mode.navigation(), window, cx);
+            view.alternative_mode = Some(mode);
+            view
+        });
+        workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+    }
 }
 
 mod persistence {
@@ -1713,16 +1984,19 @@ mod persistence {
 
     impl Domain for FileViewerDb {
         const NAME: &'static str = stringify!(FileViewerDb);
-        const MIGRATIONS: &[&str] = &[sql!(
-            CREATE TABLE file_viewers (
-                workspace_id INTEGER,
-                item_id INTEGER UNIQUE,
-                file_path BLOB,
-                PRIMARY KEY(workspace_id, item_id),
-                FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
-                ON DELETE CASCADE
-            ) STRICT;
-        )];
+        const MIGRATIONS: &[&str] = &[
+            sql!(
+                CREATE TABLE file_viewers (
+                    workspace_id INTEGER,
+                    item_id INTEGER UNIQUE,
+                    file_path BLOB,
+                    PRIMARY KEY(workspace_id, item_id),
+                    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
+                    ON DELETE CASCADE
+                ) STRICT;
+            ),
+            sql!(ALTER TABLE file_viewers ADD COLUMN mode TEXT DEFAULT NULL;),
+        ];
     }
 
     db::static_connection!(FileViewerDb, [WorkspaceDb]);
@@ -1739,6 +2013,100 @@ mod persistence {
             pub fn get_file_path(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<PathBuf>> {
                 SELECT file_path FROM file_viewers WHERE item_id = ? AND workspace_id = ?
             }
+        }
+
+        query! {
+            pub async fn save_file_state(item_id: ItemId, workspace_id: WorkspaceId, file_path: PathBuf, mode: Option<String>) -> Result<()> {
+                INSERT OR REPLACE INTO file_viewers(item_id, workspace_id, file_path, mode)
+                VALUES (?, ?, ?, ?)
+            }
+        }
+
+        query! {
+            pub fn get_file_state(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<(PathBuf, Option<String>)>> {
+                SELECT file_path, mode FROM file_viewers WHERE item_id = ? AND workspace_id = ?
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn legacy_records_migrate_without_forcing_a_mode() -> anyhow::Result<()> {
+            let connection = db::sqlez::connection::Connection::open_memory(None);
+            connection.exec("CREATE TABLE workspaces(workspace_id INTEGER PRIMARY KEY);")?()?;
+            connection.exec("INSERT INTO workspaces(workspace_id) VALUES (1);")?()?;
+            connection.migrate(
+                FileViewerDb::NAME,
+                &FileViewerDb::MIGRATIONS[..1],
+                &mut FileViewerDb::should_allow_migration_change,
+            )?;
+            let path = PathBuf::from("/tmp/legacy-preview.txt");
+            connection.exec_bound::<(ItemId, WorkspaceId, PathBuf)>(
+                "INSERT INTO file_viewers(item_id, workspace_id, file_path) VALUES (?, ?, ?)",
+            )?((1, WorkspaceId::from_i64(1), path.clone()))?;
+            connection.migrate(
+                FileViewerDb::NAME,
+                FileViewerDb::MIGRATIONS,
+                &mut FileViewerDb::should_allow_migration_change,
+            )?;
+            assert_eq!(
+                connection.select_row::<(PathBuf, Option<String>)>(
+                    "SELECT file_path, mode FROM file_viewers WHERE item_id = 1",
+                )?()?,
+                Some((path, None))
+            );
+            Ok(())
+        }
+
+        #[gpui::test]
+        async fn forced_modes_round_trip_and_legacy_path_saves_clear_the_mode(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+            let workspace_id = cx
+                .read(WorkspaceDb::global)
+                .next_id()
+                .await
+                .expect("reserved workspace");
+            let database = cx.read(FileViewerDb::global);
+            let path = PathBuf::from("/tmp/forced-preview.txt");
+            assert_eq!(
+                database
+                    .get_file_state(1, workspace_id)
+                    .expect("missing state"),
+                None
+            );
+            for mode in [None, Some("text".to_string()), Some("hex".to_string())] {
+                database
+                    .save_file_state(1, workspace_id, path.clone(), mode.clone())
+                    .await
+                    .expect("saved file state");
+                assert_eq!(
+                    database
+                        .get_file_state(1, workspace_id)
+                        .expect("saved state"),
+                    Some((path.clone(), mode))
+                );
+                assert_eq!(
+                    database
+                        .get_file_path(1, workspace_id)
+                        .expect("legacy path"),
+                    Some(path.clone())
+                );
+            }
+            database
+                .save_file_path(1, workspace_id, path.clone())
+                .await
+                .expect("legacy save");
+            assert_eq!(
+                database
+                    .get_file_state(1, workspace_id)
+                    .expect("legacy state"),
+                Some((path, None))
+            );
         }
     }
 }
@@ -1762,6 +2130,48 @@ mod tests {
         });
     }
 
+    struct TestWorkspaceRoot(Entity<Workspace>);
+
+    impl Render for TestWorkspaceRoot {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.0.update(cx, |workspace, cx| {
+                let root = div()
+                    .size_full()
+                    .key_context(workspace.key_context(cx))
+                    .child(cx.entity());
+                workspace.actions(root, window, cx)
+            })
+        }
+    }
+
+    fn workspace_with_actions(
+        project: Entity<Project>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<Workspace>, &mut gpui::VisualTestContext) {
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            TestWorkspaceRoot(cx.new(|cx| Workspace::test_new(project, window, cx)))
+        });
+        let workspace = root.read_with(cx, |root, _| root.0.clone());
+        (workspace, cx)
+    }
+
+    #[test]
+    fn plain_text_display_preserves_empty_lines_when_storage_splits_crlf() {
+        let prefix = "x".repeat(file_preview::CELL_BYTES - 1);
+        let page = PreviewPage {
+            rows: vec![
+                vec![format!("{prefix}\r")],
+                vec!["\n".into()],
+                vec!["\nnext\r\n".into()],
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            plain_text_lines(&page),
+            vec![prefix, String::new(), "next".into()]
+        );
+    }
+
     struct TestBufferView {
         buffer: Entity<language::Buffer>,
         focus_handle: FocusHandle,
@@ -1775,7 +2185,9 @@ mod tests {
     impl EventEmitter<()> for TestBufferView {}
     impl Render for TestBufferView {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div().child("Loaded text buffer")
+            div()
+                .track_focus(&self.focus_handle)
+                .child("Loaded text buffer")
         }
     }
     impl Item for TestBufferView {
@@ -1793,6 +2205,9 @@ mod tests {
         fn buffer_kind(&self, _: &App) -> ItemBufferKind {
             ItemBufferKind::Singleton
         }
+        fn is_dirty(&self, cx: &App) -> bool {
+            self.buffer.read(cx).is_dirty()
+        }
     }
     impl ProjectItem for TestBufferView {
         type Item = language::Buffer;
@@ -1808,6 +2223,318 @@ mod tests {
                 focus_handle: cx.focus_handle(),
             }
         }
+    }
+
+    #[gpui::test]
+    async fn raw_open_actions_switch_an_image_and_disable_without_a_file(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            cx.set_global(db::AppDatabase::test_new());
+            init(cx);
+        });
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let absolute_path = directory.path().join("image.png");
+        let mut encoded = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("PNG");
+        let bytes = encoded.into_inner();
+        std::fs::write(&absolute_path, &bytes).expect("PNG fixture");
+        let filesystem = FakeFs::new(cx.executor());
+        filesystem
+            .insert_tree(directory.path(), serde_json::json!({ "image.png": "" }))
+            .await;
+        let project = Project::test(filesystem, [directory.path()], cx).await;
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("worktree")
+                .read(cx)
+                .id()
+        });
+        let path = ProjectPath {
+            worktree_id,
+            path: rel_path("image.png").into(),
+        };
+        let (workspace, cx) = workspace_with_actions(project.clone(), cx);
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+            assert!(!window.is_action_available(&OpenAsPlainText, cx));
+            assert!(!window.is_action_available(&OpenAsHex, cx));
+            let buffer = cx.new(|cx| language::Buffer::local("untitled", cx));
+            let untitled = cx.new(|cx| TestBufferView {
+                buffer,
+                focus_handle: cx.focus_handle(),
+            });
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(untitled), None, true, window, cx)
+            });
+            window.refresh();
+            window.draw(cx).clear(cx);
+            assert!(!window.is_action_available(&OpenAsPlainText, cx));
+            assert!(!window.is_action_available(&OpenAsHex, cx));
+        });
+        let view = cx.update(|window, cx| {
+            let item = FileItem::new(&project, &path, cx);
+            let view = cx.new(|cx| FileView::new(item, window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx)
+            });
+            view
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.image.is_some()));
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+            assert!(window.is_action_available(&OpenAsPlainText, cx));
+            assert!(window.is_action_available(&OpenAsHex, cx));
+        });
+        cx.dispatch_action(OpenAsHex);
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.alternative_mode, Some(OpenMode::Hex));
+            assert!(view.navigation.bytes);
+            assert!(view.image.is_none());
+            assert_eq!(view.capability(cx), Capability::ReadOnly);
+            assert!(!view.can_save(cx));
+            assert!(!view.can_save_as(cx));
+            assert_eq!(view.active_project_path(cx), Some(path.clone()));
+            let page = view.page.as_ref().expect("Hex page");
+            assert!(page.is_hex);
+            assert!(page.rows[0][1].starts_with("89 50 4E 47 0D 0A 1A 0A "));
+        });
+        cx.dispatch_action(OpenAsPlainText);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.alternative_mode, Some(OpenMode::PlainText));
+            assert!(view.navigation.text);
+            assert!(!view.navigation.bytes);
+            assert!(view.image.is_none());
+            let page = view.page.as_ref().expect("plain text page");
+            assert!(!page.is_hex);
+            assert!(page.rows.iter().flatten().any(|line| line.contains("PNG")));
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.debug_bounds("file-viewer-plain-text").is_some());
+        assert!(
+            workspace.read_with(cx, |workspace, cx| workspace.active_item_as::<FileView>(cx))
+                == Some(view)
+        );
+        assert_eq!(
+            std::fs::read(absolute_path).expect("unchanged source"),
+            bytes
+        );
+        assert!(!project.read_with(cx, |project, cx| project.has_open_buffer(path, cx)));
+    }
+
+    #[gpui::test]
+    async fn raw_open_actions_preserve_unsaved_editor_and_copy_literal_text(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| {
+            cx.set_global(db::AppDatabase::test_new());
+            init(cx);
+        });
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let text = "line with\ttab\r\n\nplain \"text\"\n";
+        let absolute_path = directory.path().join("source.txt");
+        std::fs::write(&absolute_path, text).expect("text fixture");
+        let filesystem = FakeFs::new(cx.executor());
+        filesystem
+            .insert_tree(directory.path(), serde_json::json!({ "source.txt": text }))
+            .await;
+        let project = Project::test(filesystem, [directory.path()], cx).await;
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("worktree")
+                .read(cx)
+                .id()
+        });
+        let path = ProjectPath {
+            worktree_id,
+            path: rel_path("source.txt").into(),
+        };
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(path.clone(), cx))
+            .await
+            .expect("loaded text");
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(0..0, "unsaved ")], None, cx);
+        });
+        let (workspace, cx) = workspace_with_actions(project.clone(), cx);
+        let editor = cx.update(|window, cx| {
+            let editor = cx.new(|cx| TestBufferView {
+                buffer: buffer.clone(),
+                focus_handle: cx.focus_handle(),
+            });
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx)
+            });
+            window.refresh();
+            window.draw(cx).clear(cx);
+            editor
+        });
+        cx.dispatch_action(OpenAsPlainText);
+        cx.run_until_parked();
+        let view = workspace
+            .read_with(cx, |workspace, cx| workspace.active_item_as::<FileView>(cx))
+            .expect("separate plain text tab");
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .active_pane()
+                .read(cx)
+                .items_len()),
+            2
+        );
+        assert!(editor.read_with(cx, |editor, cx| editor.is_dirty(cx)));
+        assert!(
+            buffer
+                .read_with(cx, |buffer, _| buffer.text())
+                .starts_with("unsaved ")
+        );
+        assert!(!cx.has_pending_prompt());
+        cx.update(|_, cx| view.update(cx, |view, cx| view.copy_page(cx)));
+        assert_eq!(
+            cx.read(|cx| cx.read_from_clipboard().expect("raw text clipboard").text()),
+            Some(text.into())
+        );
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.activate_item(&editor, true, true, window, cx);
+            });
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        cx.dispatch_action(OpenAsHex);
+        cx.run_until_parked();
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .active_pane()
+                .read(cx)
+                .items_len()),
+            2
+        );
+        assert!(
+            workspace.read_with(cx, |workspace, cx| workspace.active_item_as::<FileView>(cx))
+                == Some(view)
+        );
+        assert!(buffer.read_with(cx, |buffer, _| buffer.is_dirty()));
+        assert_eq!(
+            std::fs::read_to_string(absolute_path).expect("unchanged source"),
+            text
+        );
+    }
+
+    #[gpui::test]
+    async fn raw_open_actions_keep_large_files_protected_until_confirmation(
+        cx: &mut TestAppContext,
+    ) {
+        use std::io::Write as _;
+        init_test(cx);
+        cx.update(|cx| {
+            cx.set_global(db::AppDatabase::test_new());
+            init(cx);
+        });
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let absolute_path = directory.path().join("large.txt");
+        let file_size = util::MAX_UNCONFIRMED_FILE_SIZE + 1;
+        let mut file = std::fs::File::create(&absolute_path).expect("sparse fixture");
+        file.write_all(&vec![b'A'; FILE_ANALYSIS_BYTES])
+            .expect("text prefix");
+        file.set_len(file_size).expect("large file");
+        let filesystem = FakeFs::new(cx.executor());
+        filesystem
+            .insert_tree(
+                directory.path(),
+                serde_json::json!({ "large.txt": "A".repeat(FILE_ANALYSIS_BYTES) }),
+            )
+            .await;
+        filesystem
+            .set_file_metadata_len(&absolute_path, file_size)
+            .expect("large metadata");
+        let project = Project::test(filesystem, [directory.path()], cx).await;
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("worktree")
+                .read(cx)
+                .id()
+        });
+        let path = ProjectPath {
+            worktree_id,
+            path: rel_path("large.txt").into(),
+        };
+        let item = cx.update(|cx| FileItem::new(&project, &path, cx));
+        item.update(cx, |item, _| item.text_file = true);
+        let (workspace, cx) = workspace_with_actions(project.clone(), cx);
+        let view = cx.update(|window, cx| {
+            let view = cx.new(|cx| FileView::new(item, window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx)
+            });
+            view
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        cx.dispatch_action(OpenAsPlainText);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.alternative_mode, Some(OpenMode::PlainText));
+            assert_eq!(view.large_file_size, Some(file_size));
+            assert!(view.navigation.bytes);
+            assert!(!view.navigation.text);
+            assert_eq!(
+                view.page.as_ref().expect("protected Hex").next_offset,
+                Some(3200)
+            );
+            assert!(view.confirmed_file_size.is_none());
+        });
+        cx.update(|window, cx| view.update(cx, |view, cx| view.open_full_content(window, cx)));
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Keep preview");
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.large_file_size.is_some()));
+        cx.update(|window, cx| view.update(cx, |view, cx| view.open_full_content(window, cx)));
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Open all content");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.large_file_size.is_none());
+            assert!(view.navigation.text);
+            assert!(!view.navigation.bytes);
+            assert_eq!(view.confirmed_file_size, Some(file_size));
+            assert!(
+                view.page
+                    .as_ref()
+                    .expect("bounded text page")
+                    .next_offset
+                    .is_some()
+            );
+        });
+        assert!(!project.read_with(cx, |project, cx| project.has_open_buffer(path, cx)));
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        cx.dispatch_action(OpenAsHex);
+        cx.run_until_parked();
+        assert!(
+            view.read_with(cx, |view, _| view.large_file_size == Some(file_size)
+                && view.confirmed_file_size.is_none())
+        );
     }
 
     #[gpui::test]
@@ -2837,6 +3564,140 @@ mod tests {
         assert_eq!(
             view.read_with(cx, |view, cx| view.capability(cx)),
             Capability::ReadOnly
+        );
+    }
+
+    #[gpui::test]
+    async fn serialized_raw_modes_restore_small_text_and_survive_splitting(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+        let directory = tempfile::tempdir().expect("test directory");
+        let absolute_path = directory.path().join("small.txt");
+        let contents = "restored view\nsecond line\n";
+        std::fs::write(&absolute_path, contents).expect("text fixture");
+        let filesystem = FakeFs::new(cx.executor());
+        filesystem
+            .insert_tree(directory.path(), serde_json::json!({"small.txt": contents}))
+            .await;
+        let project = Project::test(filesystem, [directory.path()], cx).await;
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("test worktree")
+                .read(cx)
+                .id()
+        });
+        let path = ProjectPath {
+            worktree_id,
+            path: rel_path("small.txt").into(),
+        };
+        assert!(
+            cx.update(|cx| FileItem::try_open_async(&project, &path, cx))
+                .await
+                .expect("small text probe")
+                .is_none()
+        );
+        let workspace_id = cx
+            .read(workspace::WorkspaceDb::global)
+            .next_id()
+            .await
+            .expect("reserved workspace");
+        let database = cx.read(FileViewerDb::global);
+        let window_context = cx.add_empty_window();
+        for (item_id, mode) in [(1, OpenMode::PlainText), (2, OpenMode::Hex)] {
+            database
+                .save_file_state(
+                    item_id,
+                    workspace_id,
+                    absolute_path.clone(),
+                    Some(mode.name().to_owned()),
+                )
+                .await
+                .expect("saved raw mode");
+            let restored = window_context
+                .update(|window, cx| {
+                    <FileView as SerializableItem>::deserialize(
+                        project.clone(),
+                        WeakEntity::new_invalid(),
+                        workspace_id,
+                        item_id,
+                        window,
+                        cx,
+                    )
+                })
+                .await
+                .expect("restored raw view");
+            window_context.run_until_parked();
+            restored.read_with(window_context, |view, cx| {
+                assert_eq!(view.alternative_mode, Some(mode));
+                assert_eq!(view.navigation.text, mode == OpenMode::PlainText);
+                assert_eq!(view.navigation.bytes, mode == OpenMode::Hex);
+                assert_eq!(view.navigation.offset, 0);
+                assert_eq!(view.active_project_path(cx), Some(path.clone()));
+                assert_eq!(view.capability(cx), Capability::ReadOnly);
+                assert_eq!(view.buffer_kind(cx), ItemBufferKind::None);
+                assert!(!view.can_save(cx));
+                assert!(!view.can_save_as(cx));
+                assert!(!view.is_dirty(cx));
+                assert!(view.confirmed_file_size.is_none());
+                assert!(view.error.is_none());
+                let page = view.page.as_ref().expect("restored content");
+                assert_eq!(page.is_hex, mode == OpenMode::Hex);
+                if mode == OpenMode::PlainText {
+                    assert!(
+                        page.rows
+                            .iter()
+                            .flatten()
+                            .any(|cell| cell.contains("restored view"))
+                    );
+                    assert!(
+                        page.rows
+                            .iter()
+                            .flatten()
+                            .any(|cell| cell.contains("second line"))
+                    );
+                } else {
+                    let bytes = page
+                        .rows
+                        .iter()
+                        .map(|row| row.get(1).expect("hexadecimal column"))
+                        .flat_map(|cell| cell.split_ascii_whitespace())
+                        .map(|byte| u8::from_str_radix(byte, 16).expect("hexadecimal byte"))
+                        .collect::<Vec<_>>();
+                    assert_eq!(bytes, contents.as_bytes());
+                }
+            });
+            let split = window_context
+                .update(|window, cx| {
+                    restored.update(cx, |view, cx| view.clone_on_split(None, window, cx))
+                })
+                .await
+                .expect("split raw view");
+            window_context.run_until_parked();
+            split.read_with(window_context, |view, cx| {
+                assert_eq!(view.alternative_mode, Some(mode));
+                assert_eq!(view.navigation.text, mode == OpenMode::PlainText);
+                assert_eq!(view.navigation.bytes, mode == OpenMode::Hex);
+                assert_eq!(view.active_project_path(cx), Some(path.clone()));
+                assert_eq!(view.capability(cx), Capability::ReadOnly);
+                assert_eq!(view.buffer_kind(cx), ItemBufferKind::None);
+                assert!(view.confirmed_file_size.is_none());
+                assert!(view.error.is_none());
+                assert_eq!(
+                    view.page.as_ref().expect("split content").is_hex,
+                    mode == OpenMode::Hex
+                );
+            });
+            assert!(!project.read_with(window_context, |project, cx| {
+                project.has_open_buffer(path.clone(), cx)
+            }));
+        }
+        assert_eq!(
+            std::fs::read(absolute_path).expect("unchanged source"),
+            contents.as_bytes()
         );
     }
 }

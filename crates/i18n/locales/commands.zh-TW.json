@@ -413,6 +413,8 @@
   "file finder: open without dismiss": "檔案查詢器：開啟並保留查詢器",
   "file finder: select previous": "檔案查詢器：選擇上一項",
   "file finder: toggle": "檔案查詢器：切換顯示",
+  "file viewer: open as hex": "檔案檢視器：以 Hex 開啟",
+  "file viewer: open as plain text": "檔案檢視器：以純文字開啟",
   "git: add": "Git：暫存檔案",
   "git: add to git info exclude": "Git：新增到 Git 本地排除列表",
   "git: add to gitignore": "Git：新增到 gitignore",

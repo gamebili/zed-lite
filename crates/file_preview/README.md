@@ -6,6 +6,15 @@ has a read-only tab and a paged Hex view. Unsupported content and parser failure
 automatically open Hex with the original reason visible. Unknown local binary files
 also open Hex after a bounded file-header check. Text and code continue to use the editor.
 
+The system File menu includes “Open as Plain Text” and “Open as Hex” for the current
+local file, including pictures and other binary files. Both modes are read-only
+and show the file on disk. An editor stays open with its unsaved changes; repeated
+opens reuse its alternate viewing tab. Plain text uses bounded byte windows and
+encoding-aware pagination, retains empty lines and splits long lines without
+discarding their suffixes. Invalid text is displayed with replacement characters;
+Hex preserves the exact bytes. The selected mode survives restoring and splitting
+the tab, while any large-file confirmation must be granted again.
+
 | Family | Content available |
 | --- | --- |
 | SQLite | Schema and DDL, tables/views, columns, indexes, triggers, typed records and incremental TEXT/BLOB prefixes |
@@ -41,7 +50,8 @@ in a read-only Hex preview before any complete loading or format parsing. Each
 page reads at most 3200 bytes. “Open all content” displays a confirmation with the
 file size and memory risk; cancelling retains the preview. Confirmed text opens
 in the editor, while confirmed structured formats keep their paging and decoder
-budgets. Confirmation is scoped to the current opening and file size: growth and
+budgets. Explicit Plain Text and Hex modes keep their bounded paging after
+confirmation. Confirmation is scoped to the current opening and file size: growth and
 restoring or splitting a preview require confirmation again. Direct buffer loads
 also enforce the threshold. Remote full-content confirmation is unavailable,
 and the existing 6 GiB text loading limit remains in place.

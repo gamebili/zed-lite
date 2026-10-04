@@ -1,6 +1,7 @@
-use crate::{CELL_BYTES, FileKind, PAGE_ROWS, PreviewPage, PreviewRequest};
+use crate::{CELL_BYTES, FileKind, PAGE_BYTES, PAGE_ROWS, PreviewPage, PreviewRequest};
 use anyhow::{Context as _, Result, bail, ensure};
 use std::{
+    borrow::Cow,
     fs::File,
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -80,6 +81,360 @@ pub(crate) fn bytes(path: &Path, request: &PreviewRequest) -> Result<PreviewPage
     data.truncate(length);
     let mut page = hex_page(&data, offset, size, "Hex");
     page.is_hex = true;
+    Ok(page)
+}
+
+const TEXT_HEADER_BYTES: usize = 1024;
+const TEXT_WINDOW_BYTES: usize = 64 * 1024;
+const TEXT_LOOKAHEAD_BYTES: usize = 3;
+
+#[derive(Clone, Copy)]
+enum TextEncoding {
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+    Gbk,
+}
+
+impl TextEncoding {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Utf8 => "UTF-8",
+            Self::Utf16Le => "UTF-16LE",
+            Self::Utf16Be => "UTF-16BE",
+            Self::Gbk => "GBK",
+        }
+    }
+
+    fn detect(header: &[u8], complete: bool) -> (Self, usize) {
+        if header.starts_with(b"\xef\xbb\xbf") {
+            return (Self::Utf8, 3);
+        }
+        if header.starts_with(b"\xff\xfe") {
+            return (Self::Utf16Le, 2);
+        }
+        if header.starts_with(b"\xfe\xff") {
+            return (Self::Utf16Be, 2);
+        }
+        if let Some(encoding) = Self::utf16_without_bom(header, complete) {
+            return (encoding, 0);
+        }
+        if match std::str::from_utf8(header) {
+            Ok(_) => true,
+            Err(error) => error.error_len().is_none(),
+        } {
+            return (Self::Utf8, 0);
+        }
+        let mut detector = chardetng::EncodingDetector::new();
+        detector.feed(header, complete);
+        let encoding = detector.guess(None, true);
+        if encoding == encoding_rs::GBK || encoding == encoding_rs::GB18030 {
+            (Self::Gbk, 0)
+        } else {
+            (Self::Utf8, 0)
+        }
+    }
+
+    fn utf16_without_bom(header: &[u8], complete: bool) -> Option<Self> {
+        let binary_headers: &[&[u8]] = &[
+            b"%PDF-",
+            b"PK\x03\x04",
+            b"PK\x05\x06",
+            b"PK\x07\x08",
+            b"\x89PNG\r\n\x1a\n",
+            b"\xff\xd8\xff",
+            b"GIF87a",
+            b"GIF89a",
+            b"IWAD",
+            b"PWAD",
+            b"RIFF",
+            b"OggS",
+            b"fLaC",
+            b"ID3",
+            b"\xff\xfb",
+            b"\xff\xfa",
+            b"\xff\xf3",
+            b"\xff\xf2",
+        ];
+        if header.len() < 2 || binary_headers.iter().any(|magic| header.starts_with(magic)) {
+            return None;
+        }
+        let mut even_nulls = 0;
+        let mut odd_nulls = 0;
+        for (index, byte) in header.iter().enumerate() {
+            if *byte == 0 {
+                if index.is_multiple_of(2) {
+                    even_nulls += 1;
+                } else {
+                    odd_nulls += 1;
+                }
+            }
+        }
+        if (even_nulls + odd_nulls) * 16 < header.len() {
+            return None;
+        }
+        let (encoding, decoder) = if even_nulls > odd_nulls * 4 {
+            (Self::Utf16Be, encoding_rs::UTF_16BE)
+        } else if odd_nulls > even_nulls * 4 {
+            (Self::Utf16Le, encoding_rs::UTF_16LE)
+        } else {
+            return None;
+        };
+        let mut length = header.len() / 2 * 2;
+        if !complete {
+            let bytes: [u8; 2] = header.get(length - 2..length)?.try_into().ok()?;
+            let unit = if matches!(encoding, Self::Utf16Le) {
+                u16::from_le_bytes(bytes)
+            } else {
+                u16::from_be_bytes(bytes)
+            };
+            if (0xd800..=0xdbff).contains(&unit) {
+                length -= 2;
+            }
+        }
+        let (content, errors) = decoder.decode_without_bom_handling(header.get(..length)?);
+        if errors {
+            return None;
+        }
+        let mut total = 0;
+        let mut controls = 0;
+        let mut words = 0;
+        for character in content.chars() {
+            total += 1;
+            if character.is_control() && !matches!(character, '\n' | '\r' | '\t' | '\u{c}')
+                || matches!(character, '\u{fffe}' | '\u{ffff}')
+            {
+                controls += 1;
+            } else if character == ' ' || character.is_alphanumeric() || character >= '\u{100}' {
+                words += 1;
+            }
+        }
+        (total != 0 && controls * 100 < total * 2 && words * 100 >= total * 30).then_some(encoding)
+    }
+
+    fn token(self, input: &[u8]) -> Result<TextToken<'_>> {
+        let first = *input.first().context("Missing text input byte")?;
+        match self {
+            Self::Utf8 => {
+                let length = match first {
+                    0x00..=0x7f => 1,
+                    0xc2..=0xdf => 2,
+                    0xe0..=0xef => 3,
+                    0xf0..=0xf4 => 4,
+                    _ => 1,
+                };
+                let token = input
+                    .get(..length.min(input.len()))
+                    .context("Missing UTF-8 token")?;
+                match std::str::from_utf8(token) {
+                    Ok(content) => Ok(TextToken {
+                        content: Cow::Borrowed(content),
+                        bytes: token.len(),
+                        lossy: false,
+                    }),
+                    Err(error) => Ok(TextToken {
+                        content: Cow::Borrowed("\u{fffd}"),
+                        bytes: error.error_len().unwrap_or(token.len()),
+                        lossy: true,
+                    }),
+                }
+            }
+            Self::Utf16Le | Self::Utf16Be => {
+                let unit = |bytes: &[u8]| -> Result<u16> {
+                    let bytes: [u8; 2] = bytes.try_into()?;
+                    Ok(if matches!(self, Self::Utf16Le) {
+                        u16::from_le_bytes(bytes)
+                    } else {
+                        u16::from_be_bytes(bytes)
+                    })
+                };
+                let Some(bytes) = input.get(..2) else {
+                    return Ok(TextToken {
+                        content: Cow::Borrowed("\u{fffd}"),
+                        bytes: 1,
+                        lossy: true,
+                    });
+                };
+                let first = unit(bytes)?;
+                let value = if (0xd800..=0xdbff).contains(&first) {
+                    if let Some(second) = input.get(2..4).map(unit).transpose()? {
+                        if (0xdc00..=0xdfff).contains(&second) {
+                            let value = 0x10000
+                                + ((u32::from(first) - 0xd800) << 10)
+                                + (u32::from(second) - 0xdc00);
+                            return Ok(TextToken {
+                                content: Cow::Owned(
+                                    char::from_u32(value)
+                                        .context("Invalid UTF-16 surrogate pair")?
+                                        .to_string(),
+                                ),
+                                bytes: 4,
+                                lossy: false,
+                            });
+                        }
+                    }
+                    None
+                } else if (0xdc00..=0xdfff).contains(&first) {
+                    None
+                } else {
+                    char::from_u32(u32::from(first))
+                };
+                Ok(TextToken {
+                    content: value.map_or(Cow::Borrowed("\u{fffd}"), |character| {
+                        Cow::Owned(character.to_string())
+                    }),
+                    bytes: 2,
+                    lossy: value.is_none(),
+                })
+            }
+            Self::Gbk => {
+                let length = if (0x81..=0xfe).contains(&first) {
+                    match input.get(1) {
+                        Some(0x30..=0x39)
+                            if input
+                                .get(2)
+                                .is_some_and(|byte| (0x81..=0xfe).contains(byte))
+                                && input
+                                    .get(3)
+                                    .is_some_and(|byte| (0x30..=0x39).contains(byte)) =>
+                        {
+                            4
+                        }
+                        Some(byte) if (0x40..=0xfe).contains(byte) && *byte != 0x7f => 2,
+                        _ => 1,
+                    }
+                } else {
+                    1
+                };
+                let token = input.get(..length).context("Missing GBK token")?;
+                let (content, lossy) = encoding_rs::GBK.decode_without_bom_handling(token);
+                Ok(TextToken {
+                    content,
+                    bytes: length,
+                    lossy,
+                })
+            }
+        }
+    }
+}
+
+struct TextToken<'a> {
+    content: Cow<'a, str>,
+    bytes: usize,
+    lossy: bool,
+}
+
+fn read_text_window(file: &mut File, output: &mut [u8]) -> Result<usize> {
+    let mut read = 0;
+    while read < output.len() {
+        match file.read(&mut output[read..]) {
+            Ok(0) => break,
+            Ok(length) => read += length,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(read)
+}
+
+pub(crate) fn read_text(path: &Path, request: &PreviewRequest) -> Result<PreviewPage> {
+    let mut file = File::open(path)?;
+    let metadata = file.metadata()?;
+    ensure!(metadata.is_file(), "Preview requires a regular file");
+    let size = metadata.len();
+    let mut header = [0; TEXT_HEADER_BYTES];
+    let header_length = read_text_window(&mut file, &mut header)?;
+    let (encoding, bom_bytes) = TextEncoding::detect(
+        &header[..header_length],
+        header_length < header.len() || header_length as u64 >= size,
+    );
+    let offset = request.offset.max(bom_bytes as u64).min(size);
+    file.seek(SeekFrom::Start(offset))?;
+    let mut data = vec![0; TEXT_WINDOW_BYTES + TEXT_LOOKAHEAD_BYTES];
+    let length = usize::try_from((size - offset).min(data.len() as u64))?;
+    let length = read_text_window(&mut file, &mut data[..length])?;
+    data.truncate(length);
+    let mut page = PreviewPage {
+        title: "Plain Text".into(),
+        columns: vec!["Content".into()],
+        metadata: vec![
+            ("Size".into(), format!("{size} bytes")),
+            ("Encoding".into(), encoding.name().into()),
+            ("Byte offset".into(), offset.to_string()),
+        ],
+        ..Default::default()
+    };
+    let mut cell = String::with_capacity(CELL_BYTES);
+    let mut consumed = 0;
+    let mut page_bytes = 0;
+    let mut lossy = false;
+    while consumed < data.len() && consumed < TEXT_WINDOW_BYTES && page.rows.len() < PAGE_ROWS {
+        // Starting a fresh decoder on each page requires consuming whole source
+        // characters, including up to three lookahead bytes at the window edge.
+        let mut token = encoding.token(&data[consumed..])?;
+        if token.content == "\r" {
+            let remaining = data
+                .get(consumed + token.bytes..)
+                .context("Missing text newline lookahead")?;
+            if !remaining.is_empty() {
+                let following = encoding.token(remaining)?;
+                if following.content == "\n" {
+                    token.content = Cow::Borrowed("\r\n");
+                    token.bytes += following.bytes;
+                }
+            }
+        }
+        if token
+            .content
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+        {
+            token.content = Cow::Owned(
+                token
+                    .content
+                    .chars()
+                    .map(|character| {
+                        if character.is_control() && !matches!(character, '\n' | '\r' | '\t') {
+                            '\u{fffd}'
+                        } else {
+                            character
+                        }
+                    })
+                    .collect(),
+            );
+            token.lossy = true;
+        }
+        if cell.len() + token.content.len() > CELL_BYTES {
+            page.rows.push(vec![std::mem::take(&mut cell)]);
+            if page.rows.len() == PAGE_ROWS {
+                break;
+            }
+        }
+        if page_bytes + token.content.len() > PAGE_BYTES {
+            break;
+        }
+        cell.push_str(&token.content);
+        page_bytes += token.content.len();
+        consumed += token.bytes;
+        lossy |= token.lossy;
+        if token.content.ends_with('\n') {
+            page.rows.push(vec![std::mem::take(&mut cell)]);
+        }
+    }
+    if !cell.is_empty() {
+        page.rows.push(vec![cell]);
+    }
+    let next = offset
+        .checked_add(consumed as u64)
+        .context("Text byte offset overflow")?;
+    page.next_offset = (consumed != 0 && next < size).then_some(next);
+    page.note = Some(if lossy {
+        "Read-only text detected from the first 1024 bytes. Invalid encoded bytes and binary control characters are displayed as \u{fffd}; Hex shows the exact source bytes. Long lines are split into bounded segments."
+            .into()
+    } else {
+        "Read-only text detected from the first 1024 bytes. Each page reads a 64 KiB window with character-boundary lookahead. Long lines are split into bounded segments."
+            .into()
+    });
     Ok(page)
 }
 
@@ -545,6 +900,348 @@ pub(crate) fn read(path: &Path, kind: FileKind, request: &PreviewRequest) -> Res
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn raw_text_pages(path: &Path) -> Result<(String, Vec<u64>)> {
+        let mut content = String::new();
+        let mut offsets = Vec::new();
+        let mut offset = 0;
+        for _ in 0..32 {
+            let page = crate::read_text(
+                path,
+                &PreviewRequest {
+                    offset,
+                    ..Default::default()
+                },
+            )?;
+            assert_eq!(page.title, "Plain Text");
+            assert_eq!(page.columns, ["Content"]);
+            assert!(!page.is_hex);
+            assert_eq!(page.large_file_size, None);
+            assert!(page.sections.is_empty());
+            assert!(page.image.is_none());
+            assert!(page.rows.len() <= PAGE_ROWS);
+            assert!(
+                page.rows
+                    .iter()
+                    .flatten()
+                    .all(|cell| cell.len() <= CELL_BYTES)
+            );
+            assert!(page.rows.iter().flatten().map(String::len).sum::<usize>() <= PAGE_BYTES);
+            for row in page.rows {
+                assert_eq!(row.len(), 1);
+                content.push_str(row.first().context("Missing raw text content")?);
+            }
+            let Some(next) = page.next_offset else {
+                return Ok((content, offsets));
+            };
+            assert!(next > offset);
+            assert!(next - offset <= (TEXT_WINDOW_BYTES + TEXT_LOOKAHEAD_BYTES + 3) as u64);
+            offsets.push(next);
+            offset = next;
+        }
+        bail!("Raw text fixture exceeded the expected page count")
+    }
+
+    #[test]
+    fn raw_text_preserves_utf8_across_cell_and_window_boundaries() -> Result<()> {
+        let file = tempfile::NamedTempFile::new()?;
+        let source = format!(
+            "{}🦀\n\n{}\r\n",
+            "x".repeat(TEXT_WINDOW_BYTES - 1),
+            "中文🦀".repeat(12_000)
+        );
+        std::fs::write(file.path(), &source)?;
+        let (content, offsets) = raw_text_pages(file.path())?;
+        assert_eq!(content, source);
+        assert_eq!(offsets.first(), Some(&((TEXT_WINDOW_BYTES + 3) as u64)));
+        assert!(
+            offsets
+                .iter()
+                .all(|offset| source.is_char_boundary(*offset as usize))
+        );
+        assert_eq!(std::fs::read(file.path())?, source.as_bytes());
+        Ok(())
+    }
+
+    #[test]
+    fn raw_text_utf16_surrogate_pairs_keep_exact_source_byte_offsets() -> Result<()> {
+        let file = tempfile::NamedTempFile::new()?;
+        let source = format!(
+            "{}🦀\r\n\n{}\n",
+            "a".repeat(TEXT_WINDOW_BYTES / 2 - 1),
+            "中文🦀".repeat(12_000)
+        );
+        for (little_endian, expected_encoding) in [(true, "UTF-16LE"), (false, "UTF-16BE")] {
+            let mut encoded = if little_endian {
+                vec![0xff, 0xfe]
+            } else {
+                vec![0xfe, 0xff]
+            };
+            for unit in source.encode_utf16() {
+                encoded.extend_from_slice(&if little_endian {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                });
+            }
+            std::fs::write(file.path(), &encoded)?;
+            let first = crate::read_text(file.path(), &PreviewRequest::default())?;
+            assert!(
+                first
+                    .metadata
+                    .contains(&("Encoding".into(), expected_encoding.into()))
+            );
+            assert_eq!(first.next_offset, Some((TEXT_WINDOW_BYTES + 4) as u64));
+            let (content, offsets) = raw_text_pages(file.path())?;
+            assert_eq!(content, source);
+            assert!(offsets.iter().all(|offset| offset.is_multiple_of(2)));
+            assert!(!content.contains('\u{fffd}'));
+            assert_eq!(std::fs::read(file.path())?, encoded);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn raw_text_detects_utf16_without_a_bom_before_accepting_ascii_utf8() -> Result<()> {
+        let file = tempfile::NamedTempFile::new()?;
+        let source = format!(
+            "{}\r\n\n{}\n",
+            "English header 1234 ".repeat(1800),
+            "中文🦀".repeat(12_000)
+        );
+        for (little_endian, expected_encoding) in [(true, "UTF-16LE"), (false, "UTF-16BE")] {
+            let encoded: Vec<_> = source
+                .encode_utf16()
+                .flat_map(|unit| {
+                    if little_endian {
+                        unit.to_le_bytes()
+                    } else {
+                        unit.to_be_bytes()
+                    }
+                })
+                .collect();
+            assert!(std::str::from_utf8(&encoded[..TEXT_HEADER_BYTES]).is_ok());
+            std::fs::write(file.path(), &encoded)?;
+            let first = crate::read_text(file.path(), &PreviewRequest::default())?;
+            assert!(
+                first
+                    .metadata
+                    .contains(&("Encoding".into(), expected_encoding.into()))
+            );
+            assert!(first.metadata.contains(&("Byte offset".into(), "0".into())));
+            let (content, offsets) = raw_text_pages(file.path())?;
+            assert_eq!(content, source);
+            assert!(offsets.iter().all(|offset| offset.is_multiple_of(2)));
+            assert!(!content.contains('\u{fffd}'));
+            assert_eq!(std::fs::read(file.path())?, encoded);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn raw_text_detects_gbk_and_preserves_double_byte_page_boundaries() -> Result<()> {
+        let file = tempfile::NamedTempFile::new()?;
+        let prefix = "这是采用简体中文编码的只读分页内容。".repeat(50);
+        let (encoded_prefix, _, errors) = encoding_rs::GBK.encode(&prefix);
+        assert!(!errors);
+        let padding = TEXT_WINDOW_BYTES - 1 - encoded_prefix.len();
+        let source = format!(
+            "{prefix}{}你\n\n{}\r\n",
+            "a".repeat(padding),
+            "中文内容".repeat(12_000)
+        );
+        let (encoded, _, errors) = encoding_rs::GBK.encode(&source);
+        assert!(!errors);
+        std::fs::write(file.path(), encoded.as_ref())?;
+        let first = crate::read_text(file.path(), &PreviewRequest::default())?;
+        assert!(first.metadata.contains(&("Encoding".into(), "GBK".into())));
+        assert_eq!(first.next_offset, Some((TEXT_WINDOW_BYTES + 1) as u64));
+        let (content, _) = raw_text_pages(file.path())?;
+        assert_eq!(content, source);
+        assert!(!content.contains('\u{fffd}'));
+        assert_eq!(std::fs::read(file.path())?, encoded.as_ref());
+        Ok(())
+    }
+
+    #[test]
+    fn raw_text_gbk_detection_keeps_a_pending_lead_byte_at_the_header_edge() -> Result<()> {
+        let file = tempfile::NamedTempFile::new()?;
+        let source = format!("a{}", "这是采用简体中文编码的只读分页内容。".repeat(6000));
+        let (encoded, _, errors) = encoding_rs::GBK.encode(&source);
+        assert!(!errors);
+        let (_, truncated_errors) =
+            encoding_rs::GBK.decode_without_bom_handling(&encoded[..TEXT_HEADER_BYTES]);
+        assert!(truncated_errors);
+        std::fs::write(file.path(), encoded.as_ref())?;
+        let first = crate::read_text(file.path(), &PreviewRequest::default())?;
+        assert!(first.metadata.contains(&("Encoding".into(), "GBK".into())));
+        let (content, _) = raw_text_pages(file.path())?;
+        assert_eq!(content, source);
+        assert!(!content.contains('\u{fffd}'));
+        assert_eq!(std::fs::read(file.path())?, encoded.as_ref());
+        Ok(())
+    }
+
+    #[test]
+    fn raw_text_row_limit_preserves_empty_lines_and_bom() -> Result<()> {
+        let file = tempfile::NamedTempFile::new()?;
+        let source = format!("\u{feff}{}final\r\n", "\n".repeat(PAGE_ROWS + 1));
+        std::fs::write(file.path(), &source)?;
+        let first = crate::read_text(file.path(), &PreviewRequest::default())?;
+        assert_eq!(first.rows, vec![vec!["\n".to_owned()]; PAGE_ROWS]);
+        assert_eq!(first.next_offset, Some((PAGE_ROWS + 3) as u64));
+        let second = crate::read_text(
+            file.path(),
+            &PreviewRequest {
+                offset: first.next_offset.context("Empty-line next page")?,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            second.rows,
+            [vec!["\n".to_owned()], vec!["final\r\n".to_owned()]]
+        );
+        assert_eq!(second.next_offset, None);
+        let (content, _) = raw_text_pages(file.path())?;
+        assert_eq!(content, source.trim_start_matches('\u{feff}'));
+        let past_end = crate::read_text(
+            file.path(),
+            &PreviewRequest {
+                offset: u64::MAX,
+                ..Default::default()
+            },
+        )?;
+        assert!(past_end.rows.is_empty());
+        assert_eq!(past_end.next_offset, None);
+        Ok(())
+    }
+
+    #[test]
+    fn raw_text_pages_do_not_split_crlf_at_the_byte_window_edge() -> Result<()> {
+        let file = tempfile::NamedTempFile::new()?;
+        let prefix = "x".repeat(TEXT_WINDOW_BYTES - 1);
+        let source = format!("{prefix}\r\nnext\r\n");
+        std::fs::write(file.path(), &source)?;
+        let first = crate::read_text(file.path(), &PreviewRequest::default())?;
+        assert_eq!(first.next_offset, Some((TEXT_WINDOW_BYTES + 1) as u64));
+        assert_eq!(
+            first.rows.iter().flatten().cloned().collect::<String>(),
+            format!("{prefix}\r\n")
+        );
+        let second = crate::read_text(
+            file.path(),
+            &PreviewRequest {
+                offset: first.next_offset.context("UTF-8 CRLF next page")?,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(second.rows, [vec!["next\r\n".to_string()]]);
+
+        let prefix = "x".repeat(TEXT_WINDOW_BYTES / 2 - 1);
+        let source = format!("{prefix}\r\nnext\r\n");
+        for little_endian in [true, false] {
+            let mut encoded = if little_endian {
+                vec![0xff, 0xfe]
+            } else {
+                vec![0xfe, 0xff]
+            };
+            encoded.extend(source.encode_utf16().flat_map(|unit| {
+                if little_endian {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                }
+            }));
+            std::fs::write(file.path(), &encoded)?;
+            let first = crate::read_text(file.path(), &PreviewRequest::default())?;
+            assert_eq!(first.next_offset, Some((TEXT_WINDOW_BYTES + 4) as u64));
+            assert_eq!(
+                first.rows.iter().flatten().cloned().collect::<String>(),
+                format!("{prefix}\r\n")
+            );
+            let second = crate::read_text(
+                file.path(),
+                &PreviewRequest {
+                    offset: first.next_offset.context("UTF-16 CRLF next page")?,
+                    ..Default::default()
+                },
+            )?;
+            assert_eq!(second.rows, [vec!["next\r\n".to_string()]]);
+            assert_eq!(std::fs::read(file.path())?, encoded);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn raw_text_binary_and_sparse_files_never_trigger_image_or_whole_file_decoding() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("binary.png");
+        let binary = b"\x89PNG\r\n\x1a\n\0\xffbinary\n";
+        std::fs::write(&path, binary)?;
+        let page = crate::read_text(&path, &PreviewRequest::default())?;
+        assert_eq!(page.title, "Plain Text");
+        assert!(!page.is_hex);
+        assert!(page.image.is_none());
+        assert!(
+            page.rows
+                .iter()
+                .flatten()
+                .any(|cell| cell.contains('\u{fffd}'))
+        );
+        assert!(
+            page.note
+                .as_deref()
+                .is_some_and(|note| note.contains("binary control characters"))
+        );
+        assert_eq!(std::fs::read(&path)?, binary);
+
+        let path = directory.path().join("huge.png");
+        let size = 64 * 1024 * 1024 * 1024;
+        let mut file = File::create(&path)?;
+        file.write_all(b"header\n")?;
+        file.set_len(size)?;
+        let tail = "tail🦀\n";
+        let tail_offset = size - tail.len() as u64;
+        file.seek(SeekFrom::Start(tail_offset))?;
+        file.write_all(tail.as_bytes())?;
+        drop(file);
+        let first = crate::read_text(&path, &PreviewRequest::default())?;
+        assert_eq!(first.large_file_size, None);
+        assert!(!first.is_hex);
+        assert_eq!(first.next_offset, Some(TEXT_WINDOW_BYTES as u64));
+        assert!(first.rows.len() <= PAGE_ROWS);
+        assert!(
+            first
+                .rows
+                .iter()
+                .flatten()
+                .all(|cell| cell.len() <= CELL_BYTES)
+        );
+        assert!(
+            first.rows.iter().flatten().map(String::len).sum::<usize>()
+                <= 3 * (TEXT_WINDOW_BYTES + TEXT_LOOKAHEAD_BYTES)
+        );
+        let last = crate::read_text(
+            &path,
+            &PreviewRequest {
+                offset: tail_offset,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(last.rows, [vec![tail.to_string()]]);
+        assert_eq!(last.next_offset, None);
+        assert_eq!(last.large_file_size, None);
+        assert_eq!(std::fs::metadata(&path)?.len(), size);
+        assert!(crate::read_text(directory.path(), &PreviewRequest::default()).is_err());
+        assert!(
+            crate::read_text(
+                &directory.path().join("missing"),
+                &PreviewRequest::default()
+            )
+            .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn binary_overview_properties_have_a_next_page() {

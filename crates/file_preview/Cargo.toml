@@ -20,6 +20,7 @@ url.workspace = true
 util.workspace = true
 image.workspace = true
 encoding_rs.workspace = true
+chardetng.workspace = true
 resvg.workspace = true
 quick-xml.workspace = true
 rusqlite = { version = "0.32.1", features = ["bundled", "hooks", "limits", "blob"] }
