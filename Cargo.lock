@@ -1677,6 +1677,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cfb"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8a4f8e55be323b378facfcf1f06aa97f6ec17cf4ac84fb17325093aaf62da41"
+dependencies = [
+ "byteorder",
+ "fnv",
+ "uuid",
+]
+
+[[package]]
 name = "cfg-expr"
 version = "0.20.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4376,6 +4387,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c942e64b20ecd39933d5ff938ca4fdb6ef0d298cc3855b231179a5ef0b24948d"
 
 [[package]]
+name = "fallible-iterator"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4443176a9f2c162692bd3d352d745ef9413eec5782a80d8fd6f8a1ac692a07f7"
+
+[[package]]
+name = "fallible-iterator"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
+
+[[package]]
+name = "fallible-streaming-iterator"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
+
+[[package]]
 name = "fancy-regex"
 version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4525,6 +4554,54 @@ dependencies = [
 ]
 
 [[package]]
+name = "file_preview"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cfb",
+ "encoding_rs",
+ "image",
+ "libc",
+ "object 0.37.3",
+ "pdb",
+ "quick-xml 0.41.0",
+ "resvg",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "texture2ddecoder",
+ "url",
+ "zip",
+]
+
+[[package]]
+name = "file_viewer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-lock",
+ "db",
+ "file_icons",
+ "file_preview",
+ "fs",
+ "gpui",
+ "image",
+ "language",
+ "log",
+ "project",
+ "rodio",
+ "serde_json",
+ "settings",
+ "tempfile",
+ "theme",
+ "theme_settings",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "filedescriptor"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4565,6 +4642,7 @@ checksum = "b375d6465b98090a5f25b1c7703f3859783755aa9a80433b36e0379a3ec2f369"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -5375,7 +5453,7 @@ checksum = "daa0a64d21a7eb230583b4c5f4e23b7e4e57974f96620f42a7e75e08ae66d745"
 dependencies = [
  "log",
  "plain",
- "scroll",
+ "scroll 0.12.0",
 ]
 
 [[package]]
@@ -5965,6 +6043,15 @@ name = "hashlink"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8094feaf31ff591f651a2664fb9cfd92bba7a60ce3197265e9482ebe753c8f7"
+dependencies = [
+ "hashbrown 0.14.5",
+]
+
+[[package]]
+name = "hashlink"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
 dependencies = [
  "hashbrown 0.14.5",
 ]
@@ -8526,7 +8613,7 @@ dependencies = [
  "num-derive",
  "num-traits",
  "range-map",
- "scroll",
+ "scroll 0.12.0",
  "smart-default",
 ]
 
@@ -8550,7 +8637,7 @@ dependencies = [
  "minidump-common",
  "process-backend",
  "procfs-core",
- "scroll",
+ "scroll 0.12.0",
  "serde",
  "serde_json",
  "thiserror 2.0.17",
@@ -8569,7 +8656,7 @@ dependencies = [
  "minidump-writer",
  "parking_lot",
  "polling",
- "scroll",
+ "scroll 0.12.0",
  "thiserror 2.0.17",
  "uds",
 ]
@@ -10098,6 +10185,17 @@ name = "pciid-parser"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0008e816fcdaf229cdd540e9b6ca2dc4a10d65c31624abb546c6420a02846e61"
+
+[[package]]
+name = "pdb"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82040a392923abe6279c00ab4aff62d5250d1c8555dc780e4b02783a7aa74863"
+dependencies = [
+ "fallible-iterator 0.2.0",
+ "scroll 0.11.0",
+ "uuid",
+]
 
 [[package]]
 name = "peg"
@@ -12587,6 +12685,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusqlite"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7753b721174eb8ff87a9a0e799e2d7bc3749323e773db92e0984debb00019d6e"
+dependencies = [
+ "bitflags 2.13.1",
+ "fallible-iterator 0.3.0",
+ "fallible-streaming-iterator",
+ "hashlink 0.9.1",
+ "libsqlite3-sys",
+ "smallvec",
+]
+
+[[package]]
 name = "rust-embed"
 version = "8.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12959,6 +13071,12 @@ dependencies = [
  "objc_id",
  "once_cell",
 ]
+
+[[package]]
+name = "scroll"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04c565b551bafbef4157586fa379538366e4385d42082f255bfd96e4fe8519da"
 
 [[package]]
 name = "scroll"
@@ -14639,6 +14757,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "texture2ddecoder"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "427ae8ec7f2f0fdd3146b77cfa44bea880caf066f7e55398a8467afe2645c832"
+dependencies = [
+ "paste",
+]
+
+[[package]]
 name = "theme"
 version = "0.1.0"
 dependencies = [
@@ -15631,6 +15758,12 @@ dependencies = [
  "thiserror 2.0.17",
  "utf-8",
 ]
+
+[[package]]
+name = "typed-path"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
 
 [[package]]
 name = "typeid"
@@ -18587,7 +18720,7 @@ checksum = "8902160c4e6f2fb145dbe9d6760a75e3c9522d8bf796ed7047c85919ac7115f8"
 dependencies = [
  "arraydeque",
  "encoding_rs",
- "hashlink",
+ "hashlink 0.8.4",
 ]
 
 [[package]]
@@ -18807,6 +18940,7 @@ dependencies = [
  "feature_flags",
  "feedback",
  "file_finder",
+ "file_viewer",
  "fs",
  "futures 0.3.34",
  "git",
@@ -19254,6 +19388,25 @@ dependencies = [
  "serde",
  "strum",
 ]
+
+[[package]]
+name = "zip"
+version = "8.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "indexmap",
+ "memchr",
+ "typed-path",
+]
+
+[[package]]
+name = "zlib-rs"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40990edd51aae2c2b6907af74ffb635029d5788228222c4bb811e9351c0caad3"
 
 [[package]]
 name = "zlog"

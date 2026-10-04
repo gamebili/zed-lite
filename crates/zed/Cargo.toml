@@ -95,6 +95,7 @@ edit_prediction_ui.workspace = true
 http_client.workspace = true
 i18n.workspace = true
 image_viewer.workspace = true
+file_viewer.workspace = true
 input_latency_ui.workspace = true
 inspector_ui.workspace = true
 install_cli.workspace = true

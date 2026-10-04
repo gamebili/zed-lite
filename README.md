@@ -49,3 +49,10 @@ Zed is developed by **Zed Industries, Inc.**, a for-profit company.
 If you’d like to financially support the project, you can do so via GitHub Sponsors.
 Sponsorships go directly to Zed Industries and are used as general company revenue.
 There are no perks or entitlements associated with sponsorship.
+
+## Read-only file previews
+
+This fork opens P4J's 191 recognized file extensions in read-only tabs with bounded
+content paging, including SQLite schema and records, Office contents, media and
+binary structures. See [preview support and resource budgets](crates/file_preview/README.md)
+for available renderers, tool requirements and limits.

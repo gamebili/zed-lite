@@ -1,0 +1,31 @@
+[package]
+name = "file_preview"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "src/file_preview.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+image.workspace = true
+encoding_rs.workspace = true
+resvg.workspace = true
+quick-xml.workspace = true
+rusqlite = { version = "0.32.1", features = ["bundled", "hooks", "limits", "blob"] }
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+cfb = "0.10"
+object = { version = "0.37.3", default-features = false, features = ["read", "std"] }
+pdb = "0.8"
+texture2ddecoder = "0.1.2"
+tempfile.workspace = true
+libc.workspace = true

@@ -194,6 +194,7 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
 static STARTUP_TIME: OnceLock<Instant> = OnceLock::new();
 
 fn main() {
+    file_viewer::run_decoder_worker_if_invoked();
     STARTUP_TIME.get_or_init(|| Instant::now());
 
     // If this process was re-executed as a Linux sandbox helper, run that mode
@@ -702,6 +703,7 @@ fn main() {
 
         editor::init(cx);
         image_viewer::init(cx);
+        file_viewer::init(cx);
         repl::notebook::init(cx);
         diagnostics::init(cx);
 

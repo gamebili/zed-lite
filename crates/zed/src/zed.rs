@@ -5951,6 +5951,7 @@ mod tests {
             outline_panel::init(cx);
             terminal_view::init(cx);
             image_viewer::init(cx);
+            file_viewer::init(cx);
 
             repl::init(app_state.fs.clone(), cx);
             repl::notebook::init(cx);
